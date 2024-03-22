@@ -10,12 +10,11 @@ BYTE_OF_2GB_SIZE = 2 * 1024 * 1024 * 1024
 # BYTE_OF_LIMIT_SIZE = 200 * 1024 * 1024
 BYTE_OF_LIMIT_SIZE = BYTE_OF_2GB_SIZE
 
-RECORD_FILE_PATH = './live'
+RECORD_FILE_PATH = '../live'
 
 
 class RecordFileBaseModel(BaseModel):
     file_name: str
-    stream_name: str
     timestamp: int
     file_size: int
 
@@ -61,7 +60,7 @@ class RecordFile(object):
 
     def cover_to_basemodel(self) -> RecordFileBaseModel:
         return RecordFileBaseModel(
-            file_name=self.file_name, stream_name=self.stream_name, timestamp=self.timestamp, file_size=self.file_size)
+            file_name=self.file_name, timestamp=self.timestamp, file_size=self.file_size)
 
 
 def get_all_stream_name_to_record_file_map(path: str) -> Dict[str, List[RecordFile]]:
@@ -105,8 +104,10 @@ def get_record_file_list(stream_name: str) -> List[RecordFileBaseModel]:
     stream_name_to_file_map = get_all_stream_name_to_record_file_map(
         RECORD_FILE_PATH)
     limit_record_file_size(stream_name_to_file_map)
-    file_list = stream_name_to_file_map[stream_name]
     basemodle_list = list()
+    if stream_name not in stream_name_to_file_map:
+        return basemodle_list
+    file_list = stream_name_to_file_map[stream_name]
     for f in file_list:
         basemodle_list.append(f.cover_to_basemodel())
     return basemodle_list
