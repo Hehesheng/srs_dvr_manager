@@ -114,9 +114,13 @@ def get_record_file_list(stream_name: str) -> List[RecordFileBaseModel]:
 
 
 def find_record_file_by_name(file_name: str) -> str:
-    if file_name in os.listdir(RECORD_FILE_PATH):
-        return os.path.join(RECORD_FILE_PATH, file_name)
+    file_path = os.path.join(RECORD_FILE_PATH, file_name)
+    if os.path.exists(file_path):
+        return file_path
     return ''
+    # if file_name in os.listdir(RECORD_FILE_PATH):
+    #     return os.path.join(RECORD_FILE_PATH, file_name)
+    # return ''
 
 
 if __name__ == "__main__":

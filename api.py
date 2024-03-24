@@ -1,11 +1,16 @@
 from typing import Dict, Any
+import os
 
 import uvicorn
-from fastapi import FastAPI, Body
-from fastapi.responses import Response, StreamingResponse
+from fastapi import FastAPI, Body, Header
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+import aiofiles
 
 import RecordFileManager
+
+
+CHUNK_SIZE = 1024 * 1024
 
 app = FastAPI()
 
@@ -39,9 +44,30 @@ async def read_stream_name_record_file_list(stream_name: str):
     return {"stream_name": stream_name, "files": record_file_list}
 
 
+@app.get("/stream/preview_record/{file_name}")
+async def preview_stream_video(file_name: str, range: str = Header(None)):
+    # print(f"preview {file_name} record: {range}")
+    file_path = RecordFileManager.find_record_file_by_name(file_name)
+    if file_path == '':
+        return Response(status_code=404)
+    filesize = os.stat(file_path).st_size
+    start, end = range.replace("bytes=", "").split("-")
+    start = int(start)
+    end = int(end) if end else start + 4 * CHUNK_SIZE
+    end = end if end < filesize else filesize
+    async with aiofiles.open(file_path, "rb") as video:
+        await video.seek(start)
+        data = await video.read(end - start)
+        headers = {
+            'Content-Range': f'bytes {start}-{end - 1}/{filesize}',
+            'Accept-Ranges': 'bytes'
+        }
+        # print(f"preview response: {headers}")
+        return Response(content=data, status_code=206, headers=headers, media_type="video/mp4")
+
+
 @app.get("/stream/download_record/{file_name}")
 def download_file(file_name: str):
-    CHUNK_SIZE = 1024 * 1024
     file_path = RecordFileManager.find_record_file_by_name(file_name)
     if file_path == '':
         return Response(status_code=404)
@@ -49,7 +75,7 @@ def download_file(file_name: str):
         with open(file_path, mode='rb') as f:
             while chunk := f.read(CHUNK_SIZE):
                 yield chunk
-    return StreamingResponse(iter_file(), media_type='video/*')
+    return StreamingResponse(iter_file(), media_type='video/mp4')
 
 
 if __name__ == "__main__":
