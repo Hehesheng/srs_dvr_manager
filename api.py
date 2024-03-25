@@ -2,8 +2,8 @@ from typing import Dict, Any
 import os
 
 import uvicorn
-from fastapi import FastAPI, Body, Header
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import FastAPI, Request, status, HTTPException
+from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 
@@ -40,42 +40,73 @@ async def dvr_done_callback(callback_context: Dict[Any, Any]):
 
 @app.get("/stream/query_record/{stream_name}")
 async def read_stream_name_record_file_list(stream_name: str):
-    record_file_list = RecordFileManager.get_record_file_list(stream_name)
+    record_file_list = RecordFileManager.get_base_model_record_file_list(stream_name)
     return {"stream_name": stream_name, "files": record_file_list}
 
 
-@app.get("/stream/preview_record/{file_name}")
-async def preview_stream_video(file_name: str, range: str = Header(None)):
-    # print(f"preview {file_name} record: {range}")
-    file_path = RecordFileManager.find_record_file_by_name(file_name)
-    if file_path == '':
-        return Response(status_code=404)
-    filesize = os.stat(file_path).st_size
-    start, end = range.replace("bytes=", "").split("-")
-    start = int(start)
-    end = int(end) if end else start + 4 * CHUNK_SIZE
-    end = end if end < filesize else filesize
-    async with aiofiles.open(file_path, "rb") as video:
-        await video.seek(start)
-        data = await video.read(end - start)
-        headers = {
-            'Content-Range': f'bytes {start}-{end - 1}/{filesize}',
-            'Accept-Ranges': 'bytes'
-        }
-        # print(f"preview response: {headers}")
-        return Response(content=data, status_code=206, headers=headers, media_type="video/mp4")
+async def send_bytes_range_requests(file_path: str, start: int, end: int):
+    """Send a file in chunks using Range Requests specification RFC7233
+
+    `start` and `end` parameters are inclusive due to specification
+    """
+    async with aiofiles.open(file_path, mode="rb") as f:
+        await f.seek(start)
+        while (pos := await f.tell()) <= end:
+            read_size = min(CHUNK_SIZE, end + 1 - pos)
+            yield await f.read(read_size)
 
 
-@app.get("/stream/download_record/{file_name}")
-def download_file(file_name: str):
+def _get_range_header(range_header: str, file_size: int) -> tuple[int, int]:
+    def _invalid_range():
+        return HTTPException(
+            status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail=f"Invalid request range (Range:{range_header!r})",
+        )
+
+    try:
+        h = range_header.replace("bytes=", "").split("-")
+        start = int(h[0]) if h[0] != "" else 0
+        end = int(h[1]) if h[1] != "" else file_size - 1
+    except ValueError:
+        raise _invalid_range()
+
+    if start > end or start < 0 or end > file_size - 1:
+        raise _invalid_range()
+    return start, end
+
+
+@app.get("/stream/record/{file_name}")
+async def streaming_stream_video(file_name: str, request: Request):
     file_path = RecordFileManager.find_record_file_by_name(file_name)
     if file_path == '':
-        return Response(status_code=404)
-    def iter_file():
-        with open(file_path, mode='rb') as f:
-            while chunk := f.read(CHUNK_SIZE):
-                yield chunk
-    return StreamingResponse(iter_file(), media_type='video/mp4')
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+    file_size = os.stat(file_path).st_size
+    range_header = request.headers.get("range")
+    headers = {
+        "content-type": "video/mp4",
+        "accept-ranges": "bytes",
+        "content-encoding": "identity",
+        "content-length": str(file_size),
+        "access-control-expose-headers": (
+            "content-type, accept-ranges, content-length, "
+            "content-range, content-encoding"
+        ),
+    }
+    start = 0
+    end = file_size - 1
+    status_code = status.HTTP_200_OK
+
+    if range_header is not None:
+        start, end = _get_range_header(range_header, file_size)
+        size = end - start + 1
+        headers["content-length"] = str(size)
+        headers["content-range"] = f"bytes {start}-{end}/{file_size}"
+        status_code = status.HTTP_206_PARTIAL_CONTENT
+    return StreamingResponse(
+        send_bytes_range_requests(file_path, start, end),
+        headers=headers,
+        status_code=status_code,
+    )
 
 
 if __name__ == "__main__":

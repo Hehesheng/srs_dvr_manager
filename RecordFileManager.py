@@ -1,14 +1,16 @@
 import os
 import asyncio
-from typing import Dict, List, Tuple
+from typing import List, Optional
 
 from pydantic import BaseModel
 
+BYTES_OF_GB = 1024*1024*1024
+BYTES_OF_2GB = 2 * BYTES_OF_GB
+BYTES_OF_16GB = 16 * BYTES_OF_GB
 
-BYTE_OF_2GB_SIZE = 2 * 1024 * 1024 * 1024
-
-# BYTE_OF_LIMIT_SIZE = 200 * 1024 * 1024
-BYTE_OF_LIMIT_SIZE = BYTE_OF_2GB_SIZE
+# SINGLE_STREAM_RECORD_MAX_SIZE = 200 * 1024 * 1024
+SINGLE_STREAM_RECORD_MAX_SIZE = BYTES_OF_2GB
+ALL_STREAM_RECORD_MAX_SIZE = BYTES_OF_16GB
 
 RECORD_FILE_PATH = '../live'
 
@@ -63,31 +65,29 @@ class RecordFile(object):
             file_name=self.file_name, timestamp=self.timestamp, file_size=self.file_size)
 
 
-def get_all_stream_name_to_record_file_map(path: str) -> Dict[str, List[RecordFile]]:
-    ret_map = dict()
+def get_record_file_list(path: str, stream_name: Optional[str]) -> List[RecordFile]:
+    ret_list = list()
     for file_name in os.listdir(path):
         record_file = RecordFile(file_name, path=path)
         if not record_file.is_valid():
             continue
-        if record_file.get_stream_name() not in ret_map:
-            ret_map[record_file.get_stream_name()] = [record_file]
-        else:
-            ret_map[record_file.get_stream_name()].append(record_file)
-    return ret_map
+        if stream_name != None and record_file.get_stream_name() != stream_name:
+            continue
+        ret_list.append(record_file)
+    return ret_list
 
 
-def limit_record_file_size(stream_name_to_file_map: Dict[str, List[RecordFile]]) -> None:
-    for stream_name, record_file_list in stream_name_to_file_map.items():
-        record_total_size = 0
-        record_file_list.sort(key=lambda x: x.get_timestamp())
-        del_index = 0
-        for record_file in record_file_list:
-            record_total_size += record_file.get_file_size()
-            while record_total_size > BYTE_OF_LIMIT_SIZE and record_total_size > record_file.get_file_size():
-                del_record_file(record_file_list[del_index].get_file_path())
-                record_total_size -= record_file_list[del_index].get_file_size()
-                del_index += 1
-        stream_name_to_file_map[stream_name] = record_file_list[del_index:]
+def limit_record_file_size(record_file_list: List[RecordFile], limit_size: int = SINGLE_STREAM_RECORD_MAX_SIZE) -> None:
+    record_total_size = 0
+    record_file_list.sort(key=lambda x: x.get_timestamp())
+    del_index = 0
+    for record_file in record_file_list:
+        record_total_size += record_file.get_file_size()
+        while record_total_size > limit_size and record_total_size > record_file.get_file_size():
+            del_record_file(record_file_list[del_index].get_file_path())
+            record_total_size -= record_file_list[del_index].get_file_size()
+            del_index += 1
+    record_file_list = record_file_list[del_index:]
 
 
 def del_record_file(path: str) -> None:
@@ -95,20 +95,17 @@ def del_record_file(path: str) -> None:
 
 
 def record_file_update() -> None:
-    stream_name_to_file_map = get_all_stream_name_to_record_file_map(
-        RECORD_FILE_PATH)
-    limit_record_file_size(stream_name_to_file_map)
+    record_file_list = get_record_file_list(RECORD_FILE_PATH)
+    limit_record_file_size(
+        record_file_list, limit_size=ALL_STREAM_RECORD_MAX_SIZE)
 
 
-def get_record_file_list(stream_name: str) -> List[RecordFileBaseModel]:
-    stream_name_to_file_map = get_all_stream_name_to_record_file_map(
-        RECORD_FILE_PATH)
-    limit_record_file_size(stream_name_to_file_map)
+def get_base_model_record_file_list(stream_name: str) -> List[RecordFileBaseModel]:
+    record_file_list = get_record_file_list(
+        RECORD_FILE_PATH, stream_name=stream_name)
+    limit_record_file_size(record_file_list)
     basemodle_list = list()
-    if stream_name not in stream_name_to_file_map:
-        return basemodle_list
-    file_list = stream_name_to_file_map[stream_name]
-    for f in file_list:
+    for f in record_file_list:
         basemodle_list.append(f.cover_to_basemodel())
     return basemodle_list
 
@@ -118,9 +115,6 @@ def find_record_file_by_name(file_name: str) -> str:
     if os.path.exists(file_path):
         return file_path
     return ''
-    # if file_name in os.listdir(RECORD_FILE_PATH):
-    #     return os.path.join(RECORD_FILE_PATH, file_name)
-    # return ''
 
 
 if __name__ == "__main__":
