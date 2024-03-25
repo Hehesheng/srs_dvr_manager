@@ -40,7 +40,8 @@ async def dvr_done_callback(callback_context: Dict[Any, Any]):
 
 @app.get("/stream/query_record/{stream_name}")
 async def read_stream_name_record_file_list(stream_name: str):
-    record_file_list = RecordFileManager.get_base_model_record_file_list(stream_name)
+    record_file_list = RecordFileManager.get_base_model_record_file_list(
+        stream_name)
     return {"stream_name": stream_name, "files": record_file_list}
 
 
@@ -75,8 +76,8 @@ def _get_range_header(range_header: str, file_size: int) -> tuple[int, int]:
     return start, end
 
 
-@app.get("/stream/record/{file_name}")
-async def streaming_stream_video(file_name: str, request: Request):
+@app.get("/stream/record/p/{file_name}")
+async def streaming_response_stream_record(file_name: str, request: Request):
     file_path = RecordFileManager.find_record_file_by_name(file_name)
     if file_path == '':
         return Response(status_code=status.HTTP_404_NOT_FOUND)
@@ -107,6 +108,11 @@ async def streaming_stream_video(file_name: str, request: Request):
         headers=headers,
         status_code=status_code,
     )
+
+
+@app.get("/stream/record/d/{file_name}")
+async def download_record_file(file_name: str, request: Request):
+    return await streaming_response_stream_record(file_name, request)
 
 
 if __name__ == "__main__":
