@@ -6,11 +6,12 @@ from pydantic import BaseModel
 
 BYTES_OF_GB = 1024*1024*1024
 BYTES_OF_2GB = 2 * BYTES_OF_GB
+BYTES_OF_4GB = 4 * BYTES_OF_GB
+BYTES_OF_8GB = 8 * BYTES_OF_GB
 BYTES_OF_16GB = 16 * BYTES_OF_GB
 
-# SINGLE_STREAM_RECORD_MAX_SIZE = 200 * 1024 * 1024
 SINGLE_STREAM_RECORD_MAX_SIZE = BYTES_OF_2GB
-ALL_STREAM_RECORD_MAX_SIZE = BYTES_OF_16GB
+ALL_STREAM_RECORD_MAX_SIZE = BYTES_OF_8GB
 
 RECORD_FILE_PATH = '../live'
 
@@ -102,7 +103,7 @@ def get_record_file_list(path: str, stream_name: Optional[str] = None) -> List[R
 def limit_record_file_size(
     record_file_list: List[RecordFile],
     limit_size: int = SINGLE_STREAM_RECORD_MAX_SIZE
-) -> None:
+) -> List[RecordFile]:
     record_total_size = 0
     record_file_list.sort(key=lambda x: x.timestamp)
     del_index = 0
@@ -113,7 +114,7 @@ def limit_record_file_size(
             del_record_file(record_file_list[del_index].file_path)
             record_total_size -= record_file_list[del_index].file_size
             del_index += 1
-    record_file_list = record_file_list[del_index:]
+    return record_file_list[del_index:]
 
 
 def del_record_file(path: str) -> None:
@@ -130,7 +131,8 @@ def clear_crash_uncomplete_tmp_files(path: str) -> None:
             continue
         if record_file.stream_name in last_record_file_map:
             if last_record_file_map[record_file.stream_name].timestamp < record_file.timestamp:
-                del_record_file(last_record_file_map[record_file.stream_name].file_path)
+                del_record_file(
+                    last_record_file_map[record_file.stream_name].file_path)
                 last_record_file_map[record_file.stream_name] = record_file
             else:
                 del_record_file(record_file.file_path)
@@ -138,18 +140,24 @@ def clear_crash_uncomplete_tmp_files(path: str) -> None:
             last_record_file_map[record_file.stream_name] = record_file
 
 
-def record_file_update() -> None:
-    record_file_list = get_record_file_list(RECORD_FILE_PATH)
-    limit_record_file_size(
-        record_file_list, limit_size=ALL_STREAM_RECORD_MAX_SIZE)
+def record_file_update(stream_name: Optional[str] = None) -> None:
+    if stream_name is not None:
+        get_and_limit_stream_record_file_list(stream_name)
+    get_and_limit_all_stream_record_file_list()
     # clear crash record files
     clear_crash_uncomplete_tmp_files(RECORD_FILE_PATH)
 
 
+def get_and_limit_stream_record_file_list(stream_name: str) -> List[RecordFile]:
+    return limit_record_file_size(get_record_file_list(RECORD_FILE_PATH, stream_name=stream_name))
+
+
+def get_and_limit_all_stream_record_file_list() -> List[RecordFile]:
+    return limit_record_file_size(get_record_file_list(RECORD_FILE_PATH), limit_size=ALL_STREAM_RECORD_MAX_SIZE)
+
+
 def get_base_model_record_file_list(stream_name: str) -> List[RecordFileBaseModel]:
-    record_file_list = get_record_file_list(
-        RECORD_FILE_PATH, stream_name=stream_name)
-    limit_record_file_size(record_file_list)
+    record_file_list = get_and_limit_stream_record_file_list(stream_name)
     basemodle_list = list()
     for f in record_file_list:
         basemodle_list.append(f.cover_to_basemodel())

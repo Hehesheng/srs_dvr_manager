@@ -34,7 +34,7 @@ def read_root():
 async def dvr_done_callback(callback_context: Dict[Any, Any]):
     # print(callback_context)
     # {'server_id': 'vid-390ik4q', 'service_id': '900vr5u1', 'action': 'on_dvr', 'client_id': '1v62389x', 'ip': '172.19.0.1', 'vhost': '__defaultVhost__', 'app': 'live', 'tcUrl': 'rtmp://[2406:da14:2b7:8500:38d8:bcae:8ff9:fe7]:11935/live', 'stream': 'hehe', 'param': '', 'cwd': '/usr/local/srs', 'file': './objs/nginx/html/record/live/hehe.2024-03-22.05:41:56.1711086116534.flv', 'stream_url': '/live/hehe', 'stream_id': 'vid-7tm5r5z'}
-    RecordFileManager.record_file_update()
+    RecordFileManager.record_file_update(callback_context.get('stream'))
     return 0
 
 
@@ -45,7 +45,7 @@ async def read_stream_name_record_file_list(stream_name: str):
     return {"stream_name": stream_name, "files": record_file_list}
 
 
-async def send_bytes_range_requests(file_path: str, start: int, end: int):
+async def send_bytes_range_requests(file_path: str, start: int, end: int, req: Request):
     """Send a file in chunks using Range Requests specification RFC7233
 
     `start` and `end` parameters are inclusive due to specification
@@ -55,6 +55,8 @@ async def send_bytes_range_requests(file_path: str, start: int, end: int):
         while (pos := await f.tell()) <= end:
             read_size = min(CHUNK_SIZE, end + 1 - pos)
             yield await f.read(read_size)
+            if await req.is_disconnected():
+                break
 
 
 def _get_range_header(range_header: str, file_size: int) -> tuple[int, int]:
@@ -104,7 +106,7 @@ async def streaming_response_stream_record(file_name: str, request: Request):
         headers["content-range"] = f"bytes {start}-{end}/{file_size}"
         status_code = status.HTTP_206_PARTIAL_CONTENT
     return StreamingResponse(
-        send_bytes_range_requests(file_path, start, end),
+        send_bytes_range_requests(file_path, start, end, request),
         headers=headers,
         status_code=status_code,
     )
