@@ -8,12 +8,13 @@ BYTES_OF_GB = 1024*1024*1024
 BYTES_OF_2GB = 2 * BYTES_OF_GB
 BYTES_OF_4GB = 4 * BYTES_OF_GB
 BYTES_OF_8GB = 8 * BYTES_OF_GB
+BYTES_OF_10GB = 10 * BYTES_OF_GB
 BYTES_OF_16GB = 16 * BYTES_OF_GB
 
-SINGLE_STREAM_RECORD_MAX_SIZE = BYTES_OF_2GB
-ALL_STREAM_RECORD_MAX_SIZE = BYTES_OF_8GB
+SINGLE_STREAM_RECORD_MAX_SIZE = BYTES_OF_4GB
+ALL_STREAM_RECORD_MAX_SIZE = BYTES_OF_10GB
 
-RECORD_FILE_PATH = '../live'
+RECORD_FILE_PATH = "./live"
 
 
 class RecordFileBaseModel(BaseModel):
@@ -117,6 +118,13 @@ def limit_record_file_size(
     return record_file_list[del_index:]
 
 
+def get_specified_record_file(path: str, file_name: str) -> RecordFile | None:
+    real_file_path = os.path.join(path, file_name)
+    if os.path.isfile(real_file_path):
+        return RecordFile(file_name, path=path)
+    return None
+
+
 def del_record_file(path: str) -> None:
     os.remove(path)
 
@@ -140,7 +148,11 @@ def clear_crash_uncomplete_tmp_files(path: str) -> None:
             last_record_file_map[record_file.stream_name] = record_file
 
 
-def record_file_update(stream_name: Optional[str] = None) -> None:
+def record_file_update(stream_name: Optional[str] = None, file_name: str = "", enable_record: bool = True) -> None:
+    if not enable_record:
+        record_file = get_specified_record_file(RECORD_FILE_PATH, file_name)
+        if record_file is not None:
+            del_record_file(record_file.file_path)
     if stream_name is not None:
         get_and_limit_stream_record_file_list(stream_name)
     get_and_limit_all_stream_record_file_list()

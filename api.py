@@ -1,5 +1,7 @@
 from typing import Dict, Any
 import os
+import traceback
+import urllib.parse
 
 import uvicorn
 from fastapi import FastAPI, Request, status, HTTPException
@@ -32,16 +34,28 @@ def read_root():
 
 @app.post("/stream/on_dvr/")
 async def dvr_done_callback(callback_context: Dict[Any, Any]):
-    # print(callback_context)
+    print(callback_context)
     # {'server_id': 'vid-390ik4q', 'service_id': '900vr5u1', 'action': 'on_dvr', 'client_id': '1v62389x', 'ip': '172.19.0.1', 'vhost': '__defaultVhost__', 'app': 'live', 'tcUrl': 'rtmp://[2406:da14:2b7:8500:38d8:bcae:8ff9:fe7]:11935/live', 'stream': 'hehe', 'param': '', 'cwd': '/usr/local/srs', 'file': './objs/nginx/html/record/live/hehe.2024-03-22.05:41:56.1711086116534.flv', 'stream_url': '/live/hehe', 'stream_id': 'vid-7tm5r5z'}
-    RecordFileManager.record_file_update(callback_context.get('stream'))
+    url_param = callback_context.get("param")
+    enable_record = True
+    if url_param is not None:
+        try:
+            url_param = url_param.lstrip("?")
+            url_param_dict = urllib.parse.parse_qs(url_param)
+            url_param_dict = {k: v[0] if len(v) == 1 else v for k, v in url_param_dict.items()}
+            enable_record = url_param_dict.get("record", "true").lower() == "true"
+        except Exception as e:
+            print(e, traceback.format_exc())
+    record_file_name = callback_context.get("file", "").split("/")[-1]
+    RecordFileManager.record_file_update(
+        stream_name=callback_context.get("stream"), file_name=record_file_name, enable_record=enable_record
+    )
     return 0
 
 
 @app.get("/stream/query_record/{stream_name}")
 async def read_stream_name_record_file_list(stream_name: str):
-    record_file_list = RecordFileManager.get_base_model_record_file_list(
-        stream_name)
+    record_file_list = RecordFileManager.get_base_model_record_file_list(stream_name)
     return {"stream_name": stream_name, "files": record_file_list}
 
 
@@ -81,7 +95,7 @@ def _get_range_header(range_header: str, file_size: int) -> tuple[int, int]:
 @app.get("/stream/record/p/{file_name}")
 async def streaming_response_stream_record(file_name: str, request: Request):
     file_path = RecordFileManager.find_record_file_by_name(file_name)
-    if file_path == '':
+    if file_path == "":
         return Response(status_code=status.HTTP_404_NOT_FOUND)
     file_size = os.stat(file_path).st_size
     range_header = request.headers.get("range")
@@ -90,10 +104,7 @@ async def streaming_response_stream_record(file_name: str, request: Request):
         "accept-ranges": "bytes",
         "content-encoding": "identity",
         "content-length": str(file_size),
-        "access-control-expose-headers": (
-            "content-type, accept-ranges, content-length, "
-            "content-range, content-encoding"
-        ),
+        "access-control-expose-headers": ("content-type, accept-ranges, content-length, " "content-range, content-encoding"),
     }
     start = 0
     end = file_size - 1
