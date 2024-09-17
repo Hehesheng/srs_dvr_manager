@@ -1,6 +1,9 @@
+import logging.handlers
 from typing import Dict, Any
 import os
 import traceback
+import logging
+import yaml
 import urllib.parse
 
 import uvicorn
@@ -10,6 +13,19 @@ from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 
 import RecordFileManager
+
+log_config = None
+if not os.path.exists(os.path.dirname(__file__) + "/logs"):
+    os.mkdir(os.path.dirname(__file__) + "/logs")
+with open("logging_config.yaml", "r") as f:
+    log_config = yaml.safe_load(f.read())
+    logging.config.dictConfig(log_config)
+
+logger = logging.getLogger(__file__.split("/")[-1])
+
+for handle in logger.handlers:
+    if isinstance(handle, logging.handlers.TimedRotatingFileHandler):
+        handle.suffix = "%Y-%m-%d.log"
 
 
 CHUNK_SIZE = 1024 * 1024

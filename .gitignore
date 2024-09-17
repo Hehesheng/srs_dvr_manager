@@ -2,3 +2,4 @@ __pycache__
 .venv
 backupsrc
 live
+config.yaml
