@@ -3,3 +3,5 @@ __pycache__
 backupsrc
 live
 config.yaml
+logs
+.vscode

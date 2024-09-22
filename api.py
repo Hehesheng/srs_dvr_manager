@@ -5,14 +5,16 @@ import traceback
 import logging
 import yaml
 import urllib.parse
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request, status, HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 
 import RecordFileManager
+from alist_record_manager import AlistRecordManager
 
 log_config = None
 if not os.path.exists(os.path.dirname(__file__) + "/logs"):
@@ -30,7 +32,21 @@ for handle in logger.handlers:
 
 CHUNK_SIZE = 1024 * 1024
 
-app = FastAPI()
+
+alist_record_mgr: AlistRecordManager | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load
+    alist_record_mgr = AlistRecordManager()
+    await alist_record_mgr.init()
+    yield
+    # Clean up
+    await alist_record_mgr.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 origins = ["*"]
 
@@ -67,6 +83,12 @@ async def dvr_done_callback(callback_context: Dict[Any, Any]):
         stream_name=callback_context.get("stream"), file_name=record_file_name, enable_record=enable_record
     )
     return 0
+
+
+@app.get("/stream/cover/{stream_name}")
+async def get_stream_cover(stream_name: str, req: Request):
+    stream = await alist_record_mgr.get_stream_cover(stream_name)
+    return Response(stream["cover"], media_type="image/jpeg")
 
 
 @app.get("/stream/query_record/{stream_name}")
