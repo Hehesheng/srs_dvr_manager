@@ -21,8 +21,8 @@ class RecordFileBaseModel(BaseModel):
     file_name: str
     timestamp: int
     file_size: int
-    download_url: str
-    thumb_url: str
+    download_url: str | None = None
+    thumb_url: str | None = None
 
 
 class RecordFile(object):

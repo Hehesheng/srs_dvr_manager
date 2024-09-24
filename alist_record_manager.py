@@ -1,11 +1,14 @@
 import os
+import time
 import asyncio
 import datetime
-from typing import List, Optional
+import logging
 
 from pydantic import BaseModel
 
 from alist_file_agent import AlistFileSystemAgent
+
+logger = logging.getLogger(__file__.split("/")[-1])
 
 AlistFileInfo = AlistFileSystemAgent.ReqListFilesStruct.DataStruct.ContentStruct
 
@@ -43,23 +46,34 @@ class AlistRecordManager(object):
     async def close(self) -> None:
         pass
 
-    def _generate_stream_cover(self, stream_name) -> int:
-        return os.system(
-            f"yes | ffmpeg -i rtmp://localhost:1935/live/{stream_name} -ss 0 -f image2 -vframes 1 ./live/cover/img_cover_{stream_name}.jpg"
-        )
+    async def _generate_stream_cover(self, stream_name) -> None:
+
+        def _inner_generate_cover() -> int:
+            return os.system(
+                f"yes | ffmpeg -i rtmp://localhost/live/{stream_name} -ss 0 -f image2 -vframes 1 ./live/cover/img_cover_{stream_name}.jpg"
+            )
+
+        try:
+            sys_code = await asyncio.wait_for(asyncio.to_thread(_inner_generate_cover), timeout=10)
+            if sys_code != 0:
+                logger.error(f"generate stream cover failed, stream name is {stream_name}")
+        except TimeoutError as e:
+            logger.error(f"{e}")
 
     async def get_stream_cover(self, stream_name: str, inner: bool = False) -> bytes | None:
         cover_files: list[AlistFileInfo] = await self._file_agent.list_files("/local/cover")
-        for cover_info in cover_files:
+        for cover_info in cover_files or []:
             if cover_info.name == f"img_cover_{stream_name}.jpg":
-                create_time = datetime.datetime.strptime(cover_info.created, "%Y-%m-%dT%H:%M:%S.%f%z")
-                if (datetime.datetime.now() - create_time).seconds > 10:
-                    self._generate_stream_cover(stream_name)
-                with open(f"./live/cover/img_cover_{stream_name}.jpg") as f:
+                created_fix_slice = cover_info.created.split(".")
+                created_fix_str = created_fix_slice[0] + cover_info.created[-6:]
+                create_time = datetime.datetime.strptime(created_fix_str, "%Y-%m-%dT%H:%M:%S%z")
+                if time.time() - create_time.timestamp() > 10:
+                    await self._generate_stream_cover(stream_name)
+                with open(f"./live/cover/img_cover_{stream_name}.jpg", mode="rb") as f:
                     return f.read()
         if inner:
             return None
-        self._generate_stream_cover(stream_name)
+        await self._generate_stream_cover(stream_name)
         return await self.get_stream_cover(stream_name, inner=True)
 
     async def _filter_get_files(self, path: str, stream_name: str) -> list[AlistFileInfo]:

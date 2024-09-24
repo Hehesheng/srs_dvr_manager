@@ -27,7 +27,15 @@ class AlistFileSystemAgent(object):
 
     async def init(self) -> None:
         self._session: aiohttp.ClientSession = aiohttp.ClientSession(base_url=self._base_url)
-        self._token = await self._get_token()
+        # repeat try init
+        for i in range(60):
+            try:
+                self._token = await self._get_token()
+                break
+            except Exception as e:
+                logger.info(f"init fail: {e}, has try {i} times")
+            await asyncio.sleep(10)
+
         asyncio.get_event_loop().call_later(24 * 60 * 60, self.loop_update_token)
 
     class ReqTokenStruct(BaseModel):
@@ -80,7 +88,7 @@ class AlistFileSystemAgent(object):
                 type: int
                 hashinfo: str
 
-            content: list[ContentStruct]
+            content: list[ContentStruct] | None
 
         data: DataStruct
 

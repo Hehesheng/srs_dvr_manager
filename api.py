@@ -39,6 +39,8 @@ alist_record_mgr: AlistRecordManager | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load
+    global alist_record_mgr
+    logger.info("init alist record manager")
     alist_record_mgr = AlistRecordManager()
     await alist_record_mgr.init()
     yield
@@ -88,7 +90,7 @@ async def dvr_done_callback(callback_context: Dict[Any, Any]):
 @app.get("/stream/cover/{stream_name}")
 async def get_stream_cover(stream_name: str, req: Request):
     stream = await alist_record_mgr.get_stream_cover(stream_name)
-    return Response(stream["cover"], media_type="image/jpeg")
+    return Response(stream, media_type="image/jpeg")
 
 
 @app.get("/stream/query_record/{stream_name}")
