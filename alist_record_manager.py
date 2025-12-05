@@ -3,6 +3,8 @@ import time
 import asyncio
 import datetime
 import logging
+import subprocess
+import traceback
 
 from pydantic import BaseModel
 
@@ -39,6 +41,7 @@ class AlistRecordManager(object):
         self.cover_file = cover_dir
         self._file_agent = AlistFileSystemAgent()
         self._cover_generate_time_dict = {}
+        self._post_cover_tasks = {}
 
     async def init(self) -> None:
         await self._file_agent.init()
@@ -47,18 +50,44 @@ class AlistRecordManager(object):
         pass
 
     async def _generate_stream_cover(self, stream_name) -> None:
+        logger.info(f"Generate stream cover: {stream_name}, {self._post_cover_tasks}")
 
-        def _inner_generate_cover() -> int:
-            return os.system(
-                f"yes | ffmpeg -i rtmp://localhost/live/{stream_name} -ss 0 -f image2 -vframes 1 ./live/cover/img_cover_{stream_name}.jpg"
-            )
+        command = [
+            "ffmpeg",
+            "-i",
+            f"rtmp://localhost/live/{stream_name}",
+            "-ss",
+            "0",
+            "-f",
+            "image2",
+            "-vframes",
+            "1",
+            f"./live/cover/img_cover_{stream_name}.jpg",
+            "-y",
+        ]
+
+        exist_task = self._post_cover_tasks.get(stream_name)
+        if exist_task is not None:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(exist_task.wait), timeout=8)
+            except Exception as e:
+                logger.error(f"{traceback.format_exc()}")
+            return
 
         try:
-            sys_code = await asyncio.wait_for(asyncio.to_thread(_inner_generate_cover), timeout=10)
-            if sys_code != 0:
-                logger.error(f"generate stream cover failed, stream name is {stream_name}")
-        except TimeoutError as e:
-            logger.error(f"{e}")
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self._post_cover_tasks[stream_name] = process
+            await asyncio.wait_for(asyncio.to_thread(process.wait), timeout=8)
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                logger.error(
+                    f"generate stream cover failed, stream name is {stream_name}, code={process.returncode}, {stdout=}, {stderr=}"
+                )
+        except Exception as e:
+            logger.error(f"{traceback.format_exc()}")
+        finally:
+            process.kill()
+            self._post_cover_tasks.pop(stream_name)
 
     async def get_stream_cover(self, stream_name: str, inner: bool = False) -> bytes | None:
         cover_files: list[AlistFileInfo] = await self._file_agent.list_files("/local/cover")

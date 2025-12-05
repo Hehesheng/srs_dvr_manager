@@ -90,6 +90,8 @@ async def dvr_done_callback(callback_context: Dict[Any, Any]):
 @app.get("/stream/cover/{stream_name}")
 async def get_stream_cover(stream_name: str, req: Request):
     stream = await alist_record_mgr.get_stream_cover(stream_name)
+    if stream is None:
+        return Response(status_code=404)
     return Response(stream, media_type="image/jpeg")
 
 
