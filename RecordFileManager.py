@@ -24,6 +24,7 @@ class RecordFileBaseModel(BaseModel):
     timestamp: int
     file_size: int
     download_url: str | None = None
+    player_url: str | None = None
     thumb_url: str | None = None
 
 

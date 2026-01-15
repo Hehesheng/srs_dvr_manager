@@ -152,6 +152,7 @@ class WebDavRecordManager:
                     timestamp=timestamp,
                     file_size=entry.size,
                     download_url=f"/stream/record/d/{entry.name}",
+                    player_url=f"/stream/record/p/{entry.name}",
                     thumb_url=f"/stream/record/cover/{self._cover_name(entry.name)}",
                 )
             )
