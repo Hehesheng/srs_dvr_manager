@@ -32,6 +32,30 @@ class WebDavClient:
         if self._session is not None:
             return
         self._session = aiohttp.ClientSession(auth=self._auth, raise_for_status=False)
+        # Ensure root directory exists
+        await self._ensure_root_dir()
+
+    async def _ensure_root_dir(self) -> None:
+        """Ensure root directory exists during initialization."""
+        if self._session is None:
+            return
+        root_path = self.root.rstrip("/")
+        url = f"{self.hostname}{root_path}/"
+        try:
+            # Check if root exists
+            head_resp = await self._session.head(url)
+            if head_resp.status in (200, 204):
+                logger.info("Root directory already exists: %s", url)
+                return
+            # Try to create root directory
+            mkcol_resp = await self._session.request("MKCOL", url)
+            await mkcol_resp.read()
+            if mkcol_resp.status in (201, 405):
+                logger.info("Root directory ready: %s", url)
+            else:
+                logger.warning("Could not ensure root directory %s, status: %s", url, mkcol_resp.status)
+        except Exception as e:
+            logger.warning("Failed to ensure root directory: %s", e)
 
     async def close(self) -> None:
         if self._session is not None:
@@ -49,23 +73,35 @@ class WebDavClient:
         cleaned_dir = remote_dir.strip("/")
         if cleaned_dir == "":
             return
+        # Create all parent directories if needed
         parts = cleaned_dir.split("/")
         current = ""
         for part in parts:
             current = f"{current}/{part}" if current else part
             url = self._build_url(current) + "/"
             try:
+                # Check if directory already exists
+                head_resp = await self._session.head(url)
+                if head_resp.status in (200, 204):
+                    # Directory already exists
+                    continue
+                # Try to create directory
                 resp = await self._session.request("MKCOL", url)
                 await resp.read()
-                if resp.status not in (201, 405):
+                if resp.status in (201, 405):
+                    logger.debug("Created directory %s", url)
+                else:
                     logger.warning("MKCOL %s failed with status %s", url, resp.status)
-            except Exception:
-                logger.exception("Ensure remote dir %s failed", url)
+            except Exception as e:
+                logger.warning("Ensure remote dir %s failed: %s", url, e)
 
     async def upload_file(self, local_path: str, remote_relative_path: str) -> None:
         if self._session is None:
             raise RuntimeError("WebDavClient not initialized")
-        await self._ensure_dir(os.path.dirname(remote_relative_path))
+        # Ensure parent directory exists
+        parent_dir = os.path.dirname(remote_relative_path)
+        if parent_dir:
+            await self._ensure_dir(parent_dir)
         url = self._build_url(remote_relative_path)
 
         async def _stream() -> AsyncIterator[bytes]:
@@ -76,10 +112,15 @@ class WebDavClient:
                         break
                     yield chunk
 
-        async with self._session.put(url, data=_stream()) as resp:
-            await resp.read()
-            if resp.status not in (200, 201, 204):
-                raise RuntimeError(f"Upload {local_path} to {url} failed, status: {resp.status}")
+        try:
+            async with self._session.put(url, data=_stream()) as resp:
+                await resp.read()
+                if resp.status not in (200, 201, 204):
+                    raise RuntimeError(f"Upload {local_path} to {url} failed, status: {resp.status}")
+                logger.info("Uploaded file to %s", url)
+        except RuntimeError as e:
+            logger.error("Upload failed: %s", e)
+            raise
 
     async def fetch_bytes(self, remote_relative_path: str) -> Optional[bytes]:
         if self._session is None:
