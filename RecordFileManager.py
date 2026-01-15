@@ -28,12 +28,8 @@ class RecordFileBaseModel(BaseModel):
 
 
 class RecordFile(object):
-    file_name: str
-    stream_name: str
-    timestamp: int
-    file_size: int
 
-    def __init__(self, file_name: str, path: str = None):
+    def __init__(self, file_name: str, path: str = ""):
         valid_media_types = ["flv", "mp4"]
         file_name_split_slice = file_name.split('.')
         self.__is_tmp_file = False

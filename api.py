@@ -1,4 +1,5 @@
 import logging.handlers
+import logging.config
 from typing import Dict, Any
 import os
 import traceback
@@ -8,13 +9,11 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, Request, status, HTTPException
-from fastapi.responses import Response, StreamingResponse, RedirectResponse
+from fastapi import FastAPI, Request, status
+from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import aiofiles
 
-import RecordFileManager
-from alist_record_manager import AlistRecordManager
+from webdav_record_manager import WebDavRecordManager
 
 log_config = None
 if not os.path.exists(os.path.dirname(__file__) + "/logs"):
@@ -30,22 +29,19 @@ for handle in logger.handlers:
         handle.suffix = "%Y-%m-%d.log"
 
 
-CHUNK_SIZE = 1024 * 1024
-
-
-alist_record_mgr: AlistRecordManager | None = None
+record_mgr: WebDavRecordManager | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load
-    global alist_record_mgr
-    logger.info("init alist record manager")
-    alist_record_mgr = AlistRecordManager()
-    await alist_record_mgr.init()
+    global record_mgr
+    logger.info("init webdav record manager")
+    record_mgr = WebDavRecordManager()
+    await record_mgr.init()
     yield
     # Clean up
-    await alist_record_mgr.close()
+    await record_mgr.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -77,92 +73,58 @@ async def dvr_done_callback(callback_context: Dict[Any, Any]):
             url_param = url_param.lstrip("?")
             url_param_dict = urllib.parse.parse_qs(url_param)
             url_param_dict = {k: v[0] if len(v) == 1 else v for k, v in url_param_dict.items()}
-            enable_record = url_param_dict.get("record", "true").lower() == "true"
+            record_value = url_param_dict.get("record", "true")
+            if isinstance(record_value, str):
+                enable_record = record_value.lower() == "true"
         except Exception as e:
             print(e, traceback.format_exc())
     record_file_name = callback_context.get("file", "").split("/")[-1]
-    RecordFileManager.record_file_update(
-        stream_name=callback_context.get("stream"), file_name=record_file_name, enable_record=enable_record
-    )
-    return 0
+    stream_name = callback_context.get("stream", "")
+    incoming_path = callback_context.get("file", "")
+    if record_mgr is not None:
+        await record_mgr.handle_record_file(
+            stream_name=stream_name,
+            file_name=record_file_name,
+            incoming_path=incoming_path,
+            enable_record=enable_record,
+        )
+    return {"code": 0}
 
 
-@app.get("/stream/cover/{stream_name}")
-async def get_stream_cover(stream_name: str, req: Request):
-    stream = await alist_record_mgr.get_stream_cover(stream_name)
+@app.get("/stream/record/cover/{cover_name}")
+async def get_record_cover(cover_name: str, req: Request):
+    if record_mgr is None:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    stream = await record_mgr.fetch_cover(cover_name)
     if stream is None:
         return Response(status_code=404)
     return Response(stream, media_type="image/jpeg")
 
 
+@app.get("/stream/cover/{cover_name}")
+async def get_stream_cover_compat(cover_name: str, req: Request):
+    return await get_record_cover(cover_name, req)
+
+
 @app.get("/stream/query_record/{stream_name}")
 async def read_stream_name_record_file_list(stream_name: str):
-    record_file_list = RecordFileManager.get_base_model_record_file_list(stream_name)
+    if record_mgr is None:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    record_file_list = await record_mgr.list_records(stream_name)
     return {"stream_name": stream_name, "files": record_file_list}
-
-
-async def send_bytes_range_requests(file_path: str, start: int, end: int, req: Request):
-    """Send a file in chunks using Range Requests specification RFC7233
-
-    `start` and `end` parameters are inclusive due to specification
-    """
-    async with aiofiles.open(file_path, mode="rb") as f:
-        await f.seek(start)
-        while (pos := await f.tell()) <= end:
-            read_size = min(CHUNK_SIZE, end + 1 - pos)
-            yield await f.read(read_size)
-            if await req.is_disconnected():
-                break
-
-
-def _get_range_header(range_header: str, file_size: int) -> tuple[int, int]:
-    def _invalid_range():
-        return HTTPException(
-            status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
-            detail=f"Invalid request range (Range:{range_header!r})",
-        )
-
-    try:
-        h = range_header.replace("bytes=", "").split("-")
-        start = int(h[0]) if h[0] != "" else 0
-        end = int(h[1]) if h[1] != "" else file_size - 1
-    except ValueError:
-        raise _invalid_range()
-
-    if start > end or start < 0 or end > file_size - 1:
-        raise _invalid_range()
-    return start, end
 
 
 @app.get("/stream/record/p/{file_name}")
 async def streaming_response_stream_record(file_name: str, request: Request):
-    file_path = RecordFileManager.find_record_file_by_name(file_name)
-    if file_path == "":
-        return Response(status_code=status.HTTP_404_NOT_FOUND)
-    file_size = os.stat(file_path).st_size
+    if record_mgr is None:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     range_header = request.headers.get("range")
-    headers = {
-        "content-type": "video/mp4",
-        "accept-ranges": "bytes",
-        "content-encoding": "identity",
-        "content-length": str(file_size),
-        "access-control-expose-headers": ("content-type, accept-ranges, content-length, " "content-range, content-encoding"),
-    }
-    start = 0
-    end = file_size - 1
-    status_code = status.HTTP_200_OK
-
-    if range_header is not None:
-        start, end = _get_range_header(range_header, file_size)
-        size = end - start + 1
-        headers["content-length"] = str(size)
-        headers["content-range"] = f"bytes {start}-{end}/{file_size}"
-        status_code = status.HTTP_206_PARTIAL_CONTENT
-    return StreamingResponse(
-        send_bytes_range_requests(file_path, start, end, request),
-        headers=headers,
-        status_code=status_code,
-    )
+    status_code, headers, body = await record_mgr.stream_record(file_name, range_header)
+    if status_code == status.HTTP_404_NOT_FOUND:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+    if status_code not in (status.HTTP_200_OK, status.HTTP_206_PARTIAL_CONTENT):
+        return Response(status_code=status.HTTP_502_BAD_GATEWAY)
+    return StreamingResponse(body, headers=headers, status_code=status_code)
 
 
 @app.get("/stream/record/d/{file_name}")
