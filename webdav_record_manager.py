@@ -2,9 +2,11 @@ import asyncio
 import logging
 import os
 import subprocess
+import time
 import traceback
 from typing import AsyncIterator, Dict, List, Optional, Tuple
 
+import aiofiles
 import yaml
 
 from RecordFileManager import RecordFileBaseModel
@@ -14,6 +16,7 @@ logger = logging.getLogger(__file__.split("/")[-1])
 
 VALID_MEDIA_TYPES = {"flv", "mp4"}
 DEFAULT_MAX_STORAGE_BYTES = 53687091200  # 50GB
+STREAM_COVER_CACHE_TTL = 300  # 5 minutes cache TTL
 
 
 class WebDavRecordManager:
@@ -34,6 +37,9 @@ class WebDavRecordManager:
         self.local_cover_dir = record_cfg.get("cover_dir", "./live/cover")
         self.remote_cover_dir = record_cfg.get("cover_remote_dir", "cover")
         self.max_storage_bytes: int = int(webdav_cfg.get("max_storage_bytes", DEFAULT_MAX_STORAGE_BYTES))
+        # Stream cover cache: {stream_name: (timestamp, cover_bytes)}
+        self._stream_cover_cache: Dict[str, Tuple[float, bytes]] = {}
+        self._stream_cover_tasks: Dict[str, asyncio.Task] = {}
 
     async def init(self) -> None:
         await self._client.init()
@@ -165,6 +171,122 @@ class WebDavRecordManager:
             target = self._cover_name(cover_name)
         remote_path = self._cover_remote_path(target)
         return await self._client.fetch_bytes(remote_path)
+
+    async def _generate_stream_cover(self, stream_name: str) -> Optional[bytes]:
+        """Generate cover for live stream from RTMP source."""
+        os.makedirs(self.local_cover_dir, exist_ok=True)
+        cover_output = os.path.join(self.local_cover_dir, f"img_cover_{stream_name}.jpg")
+        command = [
+            "ffmpeg",
+            "-i",
+            f"rtmp://localhost/live/{stream_name}",
+            "-ss",
+            "0",
+            "-f",
+            "image2",
+            "-vframes",
+            "1",
+            cover_output,
+            "-y",
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            except asyncio.TimeoutError:
+                process.kill()
+                logger.warning("Generate stream cover timeout for %s", stream_name)
+                return None
+            if process.returncode != 0:
+                logger.warning(
+                    "Generate stream cover failed for %s, code=%s, stderr=%s",
+                    stream_name,
+                    process.returncode,
+                    stderr.decode(errors="ignore"),
+                )
+                return None
+            # Read and cache the generated cover
+            if os.path.exists(cover_output):
+                async with aiofiles.open(cover_output, mode="rb") as f:
+                    cover_bytes = await f.read()
+                return cover_bytes
+            return None
+        except Exception:
+            logger.error("Failed to generate stream cover for %s: %s", stream_name, traceback.format_exc())
+            return None
+        finally:
+            # Clean up generated file
+            try:
+                if os.path.exists(cover_output):
+                    os.remove(cover_output)
+            except Exception:
+                logger.warning("Failed to remove cover file %s", cover_output)
+
+    async def get_stream_cover(self, stream_name: str) -> Optional[bytes]:
+        """Get stream cover with local cache support (5min TTL)."""
+        current_time = time.time()
+
+        # Check if cached and not expired
+        if stream_name in self._stream_cover_cache:
+            cache_time, cover_bytes = self._stream_cover_cache[stream_name]
+            if current_time - cache_time < STREAM_COVER_CACHE_TTL:
+                logger.debug("Using cached cover for stream %s", stream_name)
+                return cover_bytes
+            else:
+                # Cache expired, remove it
+                del self._stream_cover_cache[stream_name]
+
+        # If there's already a generation task, wait for it
+        if stream_name in self._stream_cover_tasks:
+            existing_task = self._stream_cover_tasks[stream_name]
+            if not existing_task.done():
+                logger.info("Waiting for ongoing cover generation for %s", stream_name)
+                try:
+                    result = await asyncio.wait_for(existing_task, timeout=15)
+                    if result:
+                        self._stream_cover_cache[stream_name] = (current_time, result)
+                    return result
+                except asyncio.TimeoutError:
+                    logger.warning("Cover generation timeout for %s", stream_name)
+                    return None
+                except Exception as e:
+                    logger.error("Cover generation task failed for %s: %s", stream_name, e)
+                    return None
+            else:
+                # Task completed, check result
+                try:
+                    result = existing_task.result()
+                    if result:
+                        self._stream_cover_cache[stream_name] = (current_time, result)
+                    del self._stream_cover_tasks[stream_name]
+                    return result
+                except Exception as e:
+                    logger.error("Cover generation task error for %s: %s", stream_name, e)
+                    del self._stream_cover_tasks[stream_name]
+                    return None
+
+        # Generate new cover
+        logger.info("Generating new cover for stream %s", stream_name)
+        generation_task = asyncio.create_task(self._generate_stream_cover(stream_name))
+        self._stream_cover_tasks[stream_name] = generation_task
+
+        try:
+            cover_bytes = await asyncio.wait_for(generation_task, timeout=15)
+            if cover_bytes:
+                self._stream_cover_cache[stream_name] = (current_time, cover_bytes)
+            return cover_bytes
+        except asyncio.TimeoutError:
+            logger.warning("Cover generation timeout for stream %s", stream_name)
+            return None
+        except Exception as e:
+            logger.error("Failed to get cover for stream %s: %s", stream_name, e)
+            return None
+        finally:
+            # Clean up task reference when done
+            if stream_name in self._stream_cover_tasks:
+                del self._stream_cover_tasks[stream_name]
 
     async def _limit_storage_size(self) -> None:
         """Limit remote storage size by deleting oldest files when exceeding limit."""

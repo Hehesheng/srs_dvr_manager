@@ -101,8 +101,20 @@ async def get_record_cover(cover_name: str, req: Request):
     return Response(stream, media_type="image/jpeg")
 
 
-@app.get("/stream/cover/{cover_name}")
+@app.get("/stream/cover/{stream_name}")
+async def get_stream_cover(stream_name: str, req: Request):
+    """Get live stream cover with 5-minute local cache."""
+    if record_mgr is None:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    cover_bytes = await record_mgr.get_stream_cover(stream_name)
+    if cover_bytes is None:
+        return Response(status_code=404)
+    return Response(cover_bytes, media_type="image/jpeg")
+
+
+@app.get("/stream/cover_compat/{cover_name}")
 async def get_stream_cover_compat(cover_name: str, req: Request):
+    """Deprecated: Use /stream/record/cover/{cover_name} instead."""
     return await get_record_cover(cover_name, req)
 
 
