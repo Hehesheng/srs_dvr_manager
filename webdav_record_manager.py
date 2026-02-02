@@ -293,9 +293,7 @@ class WebDavRecordManager:
         """Limit remote storage size by deleting oldest files when exceeding limit."""
         try:
             entries = await self._client.list_directory("")
-            # Separate media files and cover files
             media_files: List[Tuple[WebDavEntry, int]] = []
-            cover_files_map: Dict[str, str] = {}  # base_name -> cover_file_name
 
             for entry in entries:
                 if entry.is_dir:
@@ -304,23 +302,26 @@ class WebDavRecordManager:
                 if suffix in VALID_MEDIA_TYPES:
                     timestamp = self._extract_timestamp(entry.name)
                     media_files.append((entry, timestamp))
-                elif entry.name.lower().endswith(".jpg"):
-                    # Track cover files
-                    base_name = os.path.splitext(entry.name)[0]
-                    cover_files_map[base_name] = entry.name
 
-            # Calculate total size
+            cover_size_map: Dict[str, int] = {}
+            if self.remote_cover_dir:
+                try:
+                    cover_entries = await self._client.list_directory(self.remote_cover_dir)
+                    for ce in cover_entries:
+                        if not ce.is_dir and ce.name.lower().endswith(".jpg"):
+                            cover_size_map[ce.name] = ce.size
+                except Exception as e:
+                    logger.warning("Failed to list cover directory %s: %s", self.remote_cover_dir, e)
+
             total_size = sum(entry.size for entry, _ in media_files)
-            total_size += sum(e.size for e in entries if not e.is_dir and e.name.lower().endswith(".jpg"))
+            total_size += sum(cover_size_map.values())
 
             if total_size <= self.max_storage_bytes:
                 logger.info("Storage size %d bytes is within limit %d bytes", total_size, self.max_storage_bytes)
                 return
 
-            # Sort by timestamp (oldest first)
             media_files.sort(key=lambda x: x[1])
 
-            # Delete oldest files until under limit
             deleted_count = 0
             for entry, timestamp in media_files:
                 if total_size <= self.max_storage_bytes:
@@ -328,26 +329,19 @@ class WebDavRecordManager:
 
                 logger.info("Deleting old file %s (timestamp=%s, size=%d) to free space", entry.name, timestamp, entry.size)
 
-                # Delete media file
                 await self._client.delete_file(entry.name)
                 total_size -= entry.size
                 deleted_count += 1
 
-                # Delete associated cover file if exists
-                base_name = os.path.splitext(entry.name)[0]
-                cover_name = cover_files_map.get(base_name)
-                if cover_name:
-                    cover_remote_path = self._cover_remote_path(cover_name)
-                    try:
-                        await self._client.delete_file(cover_remote_path)
-                        # Find cover size and subtract it
-                        for e in entries:
-                            if not e.is_dir and cover_remote_path.endswith(e.name):
-                                total_size -= e.size
-                                break
-                        logger.info("Deleted associated cover file %s", cover_remote_path)
-                    except Exception as e:
-                        logger.warning("Failed to delete cover file %s: %s", cover_remote_path, e)
+                cover_file_name = self._cover_name(entry.name)
+                cover_remote_path = self._cover_remote_path(cover_file_name)
+                try:
+                    await self._client.delete_file(cover_remote_path)
+                    if cover_file_name in cover_size_map:
+                        total_size -= cover_size_map[cover_file_name]
+                    logger.info("Deleted associated cover file %s", cover_remote_path)
+                except Exception as e:
+                    logger.warning("Failed to delete cover file %s: %s", cover_remote_path, e)
 
             logger.info("Storage cleanup completed: deleted %d files, new total size: %d bytes", deleted_count, total_size)
         except Exception:
