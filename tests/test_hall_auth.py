@@ -18,7 +18,8 @@ def test_media_signature_roundtrip():
     assert auth.verify_media("r_1", "m_1", exp, sig)
     assert not auth.verify_media("r_1", "m_2", exp, sig)
     assert not auth.verify_media("r_2", "m_1", exp, sig)
-    assert not auth.verify_media("r_1", "m_1", exp, sig[:-1] + "0")
+    tampered = sig[:-1] + ("1" if sig[-1] == "0" else "0")
+    assert not auth.verify_media("r_1", "m_1", exp, tampered)
 
 
 def test_expired_url_is_rejected():
