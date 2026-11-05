@@ -201,3 +201,38 @@ def test_change_media_appends_to_the_playlist(monkeypatch):
             f"/hall/api/rooms/{room['room_code']}",
             headers={"X-Host-Token": room["host_token"]},
         )
+
+
+def test_playlist_accepts_url_items(monkeypatch):
+    async def fake_probe(session, url):
+        return {
+            "size": 2_048_000,
+            "mime": "video/mp4",
+            "url": url,
+            "range_supported": True,
+        }
+
+    monkeypatch.setattr("hall.manager.probe_url", fake_probe)
+    with _client(monkeypatch) as client:
+        room = _create_empty_room(client, "url playlist room")
+
+        added = _add(client, room, {"kind": "url", "url": "https://example.com/clip.mp4"})
+        assert added.status_code == 200, added.text
+        body = added.json()
+        # The first item of an empty room starts playing even when it is a URL.
+        assert body["active"] is True
+        assert body["media"]["kind"] == "url"
+        assert body["media"]["name"] == "clip.mp4"
+        assert body["media_id"] == body["playlist"][0]["media_id"]
+        assert body["media_url"]
+
+        # Files and URLs share one ordered playlist.
+        second = _add(client, room, _item("local.mp4")).json()
+        assert [item["name"] for item in second["playlist"]] == ["clip.mp4", "local.mp4"]
+        assert [item["active"] for item in second["playlist"]] == [True, False]
+        assert second["media"]["name"] == "clip.mp4"
+
+        client.delete(
+            f"/hall/api/rooms/{room['room_code']}",
+            headers={"X-Host-Token": room["host_token"]},
+        )
