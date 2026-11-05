@@ -1,0 +1,23 @@
+hall/host_source.py
+  s_856b7f4314a1d9::t_8718ef80fb0391 261-263
+tests/test_hall_host_source.py
+  s_856b7f4314a1d9::t_0c87f7ea8e35a4 84-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "6672bb8fac9cdd7265377ba8430c8140462cdc1c",
+  "prompts": {},
+  "logical_commit_id": "6672bb8fac9cdd7265377ba8430c8140462cdc1c",
+  "sessions": {
+    "s_856b7f4314a1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d0d1cf1-5130-42fb-b5ed-d7fea40259ed",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "huanghuisheng <huanghuisheng@bigo.sg>",
+      "total_additions": 3
+    }
+  }
+}
