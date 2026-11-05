@@ -91,6 +91,30 @@ def test_rate_change_is_broadcast(clock):
     assert timeline.snapshot()["position"] == pytest.approx(14.0)
 
 
+def test_silent_host_freezes_and_marks_buffering(clock):
+    timeline = HostTimeline()
+    timeline.update(_state(position=10.0))
+    clock.advance(1.0)
+    snapshot = timeline.snapshot()
+    assert snapshot["stale"] is False
+    assert snapshot["buffering"] is False
+
+    # Three missed heartbeats: stop projecting and tell members to wait.
+    clock.advance(2.0)
+    snapshot = timeline.snapshot()
+    assert snapshot["stale"] is True
+    assert snapshot["buffering"] is True
+    assert snapshot["position"] == pytest.approx(12.5)
+
+    # The next heartbeat clears the stale flag (the pulse broadcast conveys it).
+    clock.advance(1.0)
+    assert timeline.update(_state(position=14.0)) == []
+    snapshot = timeline.snapshot()
+    assert snapshot["stale"] is False
+    assert snapshot["buffering"] is False
+    assert snapshot["position"] == pytest.approx(14.0)
+
+
 def test_repeated_large_error_triggers_resync(clock):
     timeline = HostTimeline()
     timeline.update(_state(position=10.0))

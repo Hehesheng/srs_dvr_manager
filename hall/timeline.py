@@ -22,6 +22,12 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+# If the host tab is throttled or frozen, heartbeats stop arriving while the
+# websocket stays open.  Stop projecting after a few missed beats so members
+# pause instead of chasing an invented position.
+HOST_STALE_SECONDS = 2.5
+
+
 class HostTimeline:
     def __init__(self) -> None:
         now = _monotonic_ms()
@@ -128,15 +134,18 @@ class HostTimeline:
         """Project the timeline to now for clients."""
         now_mono = _monotonic_ms()
         now_wall = _wall_ms()
+        elapsed = (now_mono - self.updated_mono) / 1000.0
+        stale = self.playing and not self.buffering and elapsed > HOST_STALE_SECONDS
         position = self.position
         if self.playing and not self.buffering:
-            position += (now_mono - self.updated_mono) / 1000.0 * self.rate
+            position += min(max(0.0, elapsed), HOST_STALE_SECONDS) * self.rate
         return {
             "seq": self.seq,
             "position": round(max(0.0, position), 3),
             "rate": round(self.rate, 3),
             "playing": self.playing,
-            "buffering": self.buffering,
+            "buffering": self.buffering or stale,
+            "stale": stale,
             "updated_at": round(now_wall, 3),
             "server_ts": round(now_wall, 3),
         }

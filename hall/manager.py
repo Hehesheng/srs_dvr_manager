@@ -32,6 +32,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_media_bytes": 64 * 1024 * 1024 * 1024,
 }
 ENDED_ROOM_GRACE = 60.0
+# Re-send the projected host timeline once a second.  Members otherwise only
+# hear about changes, so any silence (seek, pause, stale tab) would leave them
+# extrapolating from an old anchor.
+HOST_PULSE_INTERVAL = 1.0
 
 
 class HallError(Exception):
@@ -102,6 +106,7 @@ class HallManager:
         self._ended_at: Dict[str, float] = {}
         self._session: Optional[aiohttp.ClientSession] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._pulse_task: Optional[asyncio.Task] = None
         self._started = False
 
     @classmethod
@@ -120,6 +125,7 @@ class HallManager:
         )
         self._started = True
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        self._pulse_task = asyncio.create_task(self._pulse_loop())
         logger.info(
             "Media hall started: max_rooms=%d block=%d cache_room=%d cache_total=%d",
             self.config.max_rooms,
@@ -130,13 +136,15 @@ class HallManager:
 
     async def stop(self) -> None:
         self._started = False
-        if self._cleanup_task is not None:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._cleanup_task = None
+        for task in (self._cleanup_task, self._pulse_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._cleanup_task = None
+        self._pulse_task = None
         for room in list(self.rooms.values()):
             await self._close_room(room, code=1001, reason="server shutting down")
         self.rooms.clear()
@@ -355,6 +363,19 @@ class HallManager:
             self._codes.pop(room.room_code, None)
         self._ended_at.pop(room.room_id, None)
         room.cache.clear()
+
+    async def _pulse_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(HOST_PULSE_INTERVAL)
+                for room in list(self.rooms.values()):
+                    if room.ended or not room.host_online or not room.members:
+                        continue
+                    await self.broadcast_host_event(room, "state")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Media hall host pulse failed")
 
     async def _cleanup_loop(self) -> None:
         while True:
