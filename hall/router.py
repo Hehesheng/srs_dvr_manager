@@ -144,10 +144,12 @@ async def add_playlist_item(
         )
     except HallError as exc:
         return _hall_error(exc)
+    # ``_media_fields`` also carries the *active* media id, so the id of the
+    # item that was just appended has to win.
     return {
+        **_media_fields(room, hall),
         "media_id": media.media_id,
         "active": activated,
-        **_media_fields(room, hall),
         "playlist": room.playlist_public(),
         "room": room.public_info(),
     }

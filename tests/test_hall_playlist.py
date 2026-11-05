@@ -83,6 +83,14 @@ def test_first_item_activates_and_others_wait(monkeypatch):
         ]
         assert [item["active"] for item in second_body["playlist"]] == [True, False]
 
+        # media_id identifies the item that was just appended, not the active
+        # one: the host UI keys its local file handles by this field.
+        first_id = first_body["playlist"][0]["media_id"]
+        second_id = second_body["playlist"][1]["media_id"]
+        assert first_body["media_id"] == first_id
+        assert second_body["media_id"] == second_id
+        assert first_id != second_id
+
         info = client.get(f"/hall/api/rooms/{room['room_code']}").json()
         assert info["media"]["name"] == "first.mp4"
         assert len(info["playlist"]) == 2
