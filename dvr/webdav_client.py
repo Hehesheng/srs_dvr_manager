@@ -8,7 +8,7 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple
 import aiofiles
 import aiohttp
 
-logger = logging.getLogger(__file__.split("/")[-1])
+logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1024 * 1024
 

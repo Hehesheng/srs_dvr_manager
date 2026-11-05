@@ -9,10 +9,10 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple
 import aiofiles
 import yaml
 
-from RecordFileManager import RecordFileBaseModel
-from webdav_client import CHUNK_SIZE, WebDavClient, WebDavEntry
+from .record_file import RecordFileBaseModel
+from .webdav_client import CHUNK_SIZE, WebDavClient, WebDavEntry
 
-logger = logging.getLogger(__file__.split("/")[-1])
+logger = logging.getLogger(__name__)
 
 VALID_MEDIA_TYPES = {"flv", "mp4"}
 DEFAULT_MAX_STORAGE_BYTES = 53687091200  # 50GB

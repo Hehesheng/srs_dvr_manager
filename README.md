@@ -40,9 +40,10 @@ DVR 回调接口 (/stream/on_dvr/)
 
 | 模块 | 功能 |
 |-----|------|
-| `webdav_client.py` | WebDAV 协议客户端实现，处理文件上传/下载/删除 |
-| `webdav_record_manager.py` | 录播和流封面管理，缓存控制，存储限制 |
-| `api.py` | FastAPI 应用，对外 API 接口 |
+| `dvr/webdav_client.py` | WebDAV 协议客户端实现，处理文件上传/下载/删除 |
+| `dvr/record_manager.py` | 录播和流封面管理，缓存控制，存储限制 |
+| `dvr/router.py` | DVR 相关 HTTP API |
+| `api.py` | FastAPI 应用入口，组装 DVR 与媒体厅路由 |
 | `config.yaml` | 配置文件，WebDAV 和本地目录设置 |
 
 ## 快速开始
@@ -368,7 +369,8 @@ grep "Generated new cover" logs/app.log
 ### 建议配置
 ```yaml
 # Uvicorn 启动参数
-uvicorn api:app --host 0.0.0.0 --port 11985 --workers 4 --loop uvloop
+# 媒体厅的房间和分片缓存都在进程内，必须保持单 worker。
+uvicorn api:app --host 0.0.0.0 --port 11985 --workers 1 --loop uvloop
 ```
 
 ## 开发
@@ -376,10 +378,13 @@ uvicorn api:app --host 0.0.0.0 --port 11985 --workers 4 --loop uvloop
 ### 项目结构
 ```
 srs_dvr_manager/
-├── api.py                       # FastAPI 应用
-├── webdav_client.py             # WebDAV 客户端
-├── webdav_record_manager.py     # 录播管理逻辑
-├── RecordFileManager.py         # 数据模型
+├── api.py                       # FastAPI 应用入口
+├── dvr/
+│   ├── __init__.py
+│   ├── router.py                # DVR HTTP API
+│   ├── record_manager.py        # 录播管理逻辑
+│   ├── record_file.py           # 数据模型
+│   └── webdav_client.py         # WebDAV 客户端
 ├── config.yaml                  # 配置文件
 ├── logging_config.yaml          # 日志配置
 ├── requirements.txt             # 依赖列表
@@ -389,11 +394,17 @@ srs_dvr_manager/
 ### 添加新功能
 
 #### 添加新的 API 端点
-在 `api.py` 中添加路由：
+DVR 相关接口在 `dvr/router.py` 中添加；媒体厅接口在 `hall/router.py` 中添加。两者通过 `api.py` 的 `include_router` 挂载：
 
 ```python
-@app.get("/api/new_endpoint")
-async def new_endpoint():
+from fastapi import APIRouter, Request, status
+from fastapi.responses import Response
+
+router = APIRouter()
+
+@router.get("/api/new_endpoint")
+async def new_endpoint(request: Request):
+    record_mgr = getattr(request.app.state, "record_mgr", None)
     if record_mgr is None:
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     # 实现逻辑
@@ -401,7 +412,7 @@ async def new_endpoint():
 ```
 
 #### 扩展 WebDAV 操作
-在 `webdav_client.py` 中添加方法：
+在 `dvr/webdav_client.py` 中添加方法：
 
 ```python
 async def custom_operation(self, path: str) -> Any:
@@ -437,7 +448,7 @@ A: 支持所有 WebDAV 兼容服务，包括 OwnCloud、Nextcloud、Aliyun Drive
 A: 编辑 `config.yaml` 中的 `max_storage_bytes` 参数（单位：字节）。
 
 **Q: 封面缓存可以禁用吗？**
-A: 可以。修改 `webdav_record_manager.py` 中的 `STREAM_COVER_CACHE_TTL = 0`。
+A: 可以。修改 `dvr/record_manager.py` 中的 `STREAM_COVER_CACHE_TTL = 0`。
 
 **Q: 支持多个 SRS 服务器吗？**
 A: 支持。每个 SRS 都可以指向同一个应用实例，应用自动处理并发。
