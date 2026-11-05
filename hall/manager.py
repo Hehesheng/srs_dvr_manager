@@ -183,6 +183,12 @@ class HallManager:
             raise HallError("room has ended", protocol.ERR_ROOM_ENDED, 410)
         return room
 
+    def list_rooms(self) -> List[Dict[str, Any]]:
+        """Active rooms, newest first, as public summaries."""
+        active = [room for room in self.rooms.values() if not room.ended]
+        active.sort(key=lambda room: room.created_at, reverse=True)
+        return [room.public_summary() for room in active]
+
     # -- creation / join ----------------------------------------------
     async def create_room(self, name: str, media_payload: Dict[str, Any]) -> Room:
         if not self.enabled:

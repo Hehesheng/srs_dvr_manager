@@ -62,6 +62,14 @@ def _hall_error(exc: HallError) -> JSONResponse:
     return _error_json(exc.status_code, exc.code, exc.message)
 
 
+@router.get("/api/rooms")
+async def list_rooms(request: Request):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    return {"rooms": hall.list_rooms()}
+
+
 @router.post("/api/rooms")
 async def create_room(payload: CreateRoomRequest, request: Request):
     hall = _hall(request)

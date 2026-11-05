@@ -201,6 +201,18 @@ class Room:
             "ended": self.ended,
         }
 
+    def public_summary(self) -> Dict[str, Any]:
+        """Small, token-free view of a room for the public room list."""
+        return {
+            "room_code": self.room_code,
+            "name": self.name,
+            "media_name": self.media.name,
+            "media_size": self.media.size,
+            "member_count": self.member_count(),
+            "host_online": self.host_online,
+            "created_at": round(self.created_at, 3),
+        }
+
     def public_info(self) -> Dict[str, Any]:
         return {
             "room_id": self.room_id,

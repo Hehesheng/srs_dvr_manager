@@ -109,3 +109,25 @@ def test_websocket_auth_and_member_readonly(monkeypatch):
                         pong = message
                         break
                 assert pong is not None and pong["t0"] == 1234
+
+
+def test_room_list_shows_active_rooms(monkeypatch):
+    with _client(monkeypatch) as client:
+        first = _create_room(client)
+        second = _create_room(client)
+        client.post(f"/hall/api/rooms/{second['room_code']}/join", json={"name": "bob"})
+
+        listed = client.get("/hall/api/rooms").json()["rooms"]
+        by_code = {room["room_code"]: room for room in listed}
+        assert set(by_code) == {first["room_code"], second["room_code"]}
+        assert by_code[second["room_code"]]["member_count"] == 1
+        assert by_code[first["room_code"]]["host_online"] is False
+        assert by_code[first["room_code"]]["media_name"] == "movie.mp4"
+        assert "host_token" not in by_code[first["room_code"]]
+
+        client.delete(
+            f"/hall/api/rooms/{first['room_code']}",
+            headers={"X-Host-Token": first["host_token"]},
+        )
+        remaining = client.get("/hall/api/rooms").json()["rooms"]
+        assert [room["room_code"] for room in remaining] == [second["room_code"]]
