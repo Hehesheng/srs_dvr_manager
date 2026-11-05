@@ -1,0 +1,25 @@
+tests/test_hall_stream.py
+  s_856b7f4314a1d9::t_b784529989f2ea 1-96
+hall/media.py
+  s_856b7f4314a1d9::t_648539455b59a4 107-153,161-163,178-179
+  s_856b7f4314a1d9::t_5716d7c8129804 3,5,10-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "57843fb9e77353ee3c3a3d628b63ce5c7803c20b",
+  "prompts": {},
+  "logical_commit_id": "57843fb9e77353ee3c3a3d628b63ce5c7803c20b",
+  "sessions": {
+    "s_856b7f4314a1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d0d1cf1-5130-42fb-b5ed-d7fea40259ed",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "huanghuisheng <huanghuisheng@bigo.sg>",
+      "total_additions": 154,
+      "total_deletions": 16
+    }
+  }
+}
