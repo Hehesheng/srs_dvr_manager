@@ -1,10 +1,15 @@
 """HTTP Range parsing and streaming helpers for hall media."""
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, Optional, Tuple
 
 from starlette.requests import Request
+
+from .host_source import HostSourceError
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_OPEN_RANGE = 8 * 1024 * 1024
 # A member stream consumes blocks strictly in order, but every block is a
@@ -137,7 +142,14 @@ async def _iter_blocks(
             if task is None:
                 task = asyncio.ensure_future(room.get_block(index))
                 task.add_done_callback(_ignore_result)
-            block = await task
+            try:
+                block = await task
+            except HostSourceError:
+                # The response headers are already on the wire.  Stop the body
+                # quietly (the player will retry or show the room state) rather
+                # than logging an ASGI traceback for an expected source loss.
+                logger.debug("Media stream ended room=%s", getattr(room, "room_id", "?"))
+                return
             if not block:
                 return
             yield index, block

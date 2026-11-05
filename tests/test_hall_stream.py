@@ -1,5 +1,6 @@
 import asyncio
 
+from hall.host_source import HostSourceError
 from hall.media import ByteRange, PREFETCH_BLOCKS, stream_full, stream_range
 
 
@@ -81,6 +82,25 @@ def test_stream_range_stops_when_client_disconnects():
         await asyncio.sleep(0.05)
         assert room.active == 0
         assert len(room.calls) <= PREFETCH_BLOCKS
+
+    asyncio.run(scenario())
+
+
+def test_stream_stops_quietly_when_source_disappears():
+    async def scenario():
+        room = FakeRoom(size=1000, block_size=64, delay=0)
+
+        async def failing(index):
+            if index == 2:
+                raise HostSourceError("SOURCE_OFFLINE", "host is offline")
+            return room.block(index)
+
+        room.get_block = failing
+        request = FakeRequest()
+        body = b"".join(
+            [chunk async for chunk in stream_range(room, request, ByteRange(0, 999), 64)]
+        )
+        assert body == room.block(0) + room.block(1)
 
     asyncio.run(scenario())
 
