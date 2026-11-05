@@ -1,0 +1,22 @@
+tests/test_hall_auth.py
+  s_856b7f4314a1d9::t_1bfa675fc95720 21-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "5cadc19830c73fc11a7afe10f857698dc5ed5764",
+  "prompts": {},
+  "logical_commit_id": "5cadc19830c73fc11a7afe10f857698dc5ed5764",
+  "sessions": {
+    "s_856b7f4314a1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d0d1cf1-5130-42fb-b5ed-d7fea40259ed",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "huanghuisheng <huanghuisheng@bigo.sg>",
+      "total_additions": 675,
+      "total_deletions": 9
+    }
+  }
+}
