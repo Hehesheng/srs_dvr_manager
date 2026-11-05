@@ -81,3 +81,20 @@ def test_detach_fails_pending_reads():
             await task
 
     asyncio.run(scenario())
+
+
+def test_fail_all_wakes_first_byte_waiter():
+    async def scenario():
+        ws = FakeWs()
+        source = HostSource(
+            "r_test", block_size=8, concurrency=2, first_byte_timeout=5.0, block_timeout=5.0
+        )
+        source.attach(ws)
+        task = asyncio.create_task(source.read(0, 8, gen=0))
+        await _wait_read(ws)
+        source.fail_all(SourceOffline("host is offline"))
+        with pytest.raises(SourceOffline):
+            await asyncio.wait_for(task, 0.5)
+        assert source.timeouts == 0
+
+    asyncio.run(scenario())

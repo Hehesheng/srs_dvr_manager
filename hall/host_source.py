@@ -258,6 +258,9 @@ class HostSource:
 
     def _fail(self, pending: PendingRead, error: HostSourceError) -> None:
         self._pending.pop(pending.req_id, None)
+        # Wake a reader that is still waiting for the first frame; otherwise it
+        # sits out the full timeout and reports a spurious source-busy error.
+        pending.first_byte.set()
         if not pending.future.done():
             pending.future.set_exception(error)
 
