@@ -99,17 +99,43 @@ def _create_room(client):
     return response.json()
 
 
-def _upload(client, room, name="zh.srt", lang="zh", body=None):
+def _upload(client, room, name="zh.srt", lang="zh", body=None, media_id=None):
     payload = body if body is not None else SRT.encode("utf-8")
+    params = {"name": name, "lang": lang}
+    if media_id is not None:
+        params["media_id"] = media_id
     return client.post(
         f"/hall/api/rooms/{room['room_id']}/subtitles",
-        params={"name": name, "lang": lang},
+        params=params,
         content=payload,
         headers={
             "X-Host-Token": room["host_token"],
             "Content-Type": "text/plain; charset=utf-8",
         },
     )
+
+
+def _add_item(client, room, name="second.mp4", size=2_000_000):
+    response = client.post(
+        f"/hall/api/rooms/{room['room_id']}/playlist",
+        json={"kind": "host_file", "name": name, "size": size, "mime": "video/mp4"},
+        headers={"X-Host-Token": room["host_token"]},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["media_id"]
+
+
+def _activate(client, room, media_id):
+    response = client.post(
+        f"/hall/api/rooms/{room['room_id']}/playlist/{media_id}/activate",
+        headers={"X-Host-Token": room["host_token"]},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _room_info(client, room):
+    return client.get(f"/hall/api/rooms/{room['room_id']}").json()
 
 
 def test_upload_and_download_subtitle(client):
@@ -256,3 +282,113 @@ def test_ended_room_rejects_subtitles(client):
     client.delete(f"/hall/api/rooms/{room['room_id']}", headers={"X-Host-Token": room["host_token"]})
     assert client.get(data["url"]).status_code == 410
     assert _upload(client, room).status_code == 410
+
+
+def test_media_scoped_subtitle_follows_its_media(client):
+    room = _create_room(client)
+    first_media = room["media_id"]
+    data = _upload(client, room, name="en.srt", lang="en", media_id=first_media).json()
+    assert data["media_id"] == first_media
+
+    info = _room_info(client, room)
+    assert [item["subtitle_id"] for item in info["subtitles"]] == [data["subtitle_id"]]
+    # The first track of the media that is already playing shows up right away.
+    assert info["active_subtitle_id"] == data["subtitle_id"]
+
+    second_media = _add_item(client, room)
+    _activate(client, room, second_media)
+    info = _room_info(client, room)
+    assert info["subtitles"] == []
+    assert info["active_subtitle_id"] is None
+
+    _activate(client, room, first_media)
+    info = _room_info(client, room)
+    assert [item["subtitle_id"] for item in info["subtitles"]] == [data["subtitle_id"]]
+    # Coming back to the item brings its own track back on screen.
+    assert info["active_subtitle_id"] == data["subtitle_id"]
+
+
+def test_media_scoped_subtitle_stays_hidden_until_its_media_plays(client):
+    room = _create_room(client)
+    second_media = _add_item(client, room)
+    data = _upload(client, room, media_id=second_media).json()
+    info = _room_info(client, room)
+    assert info["subtitles"] == []
+    assert info["active_subtitle_id"] is None
+
+    _activate(client, room, second_media)
+    info = _room_info(client, room)
+    assert [item["subtitle_id"] for item in info["subtitles"]] == [data["subtitle_id"]]
+    assert info["active_subtitle_id"] == data["subtitle_id"]
+
+
+def test_room_level_subtitle_is_listed_for_every_media(client):
+    room = _create_room(client)
+    data = _upload(client, room).json()
+    second_media = _add_item(client, room)
+    _activate(client, room, second_media)
+    info = _room_info(client, room)
+    assert [item["subtitle_id"] for item in info["subtitles"]] == [data["subtitle_id"]]
+    assert info["active_subtitle_id"] == data["subtitle_id"]
+
+
+def test_media_scoped_upload_does_not_steal_active_subtitle(client):
+    room = _create_room(client)
+    room_level = _upload(client, room).json()
+    scoped = _upload(
+        client, room, name="en.srt", lang="en", media_id=room["media_id"]
+    ).json()
+    info = _room_info(client, room)
+    assert info["active_subtitle_id"] == room_level["subtitle_id"]
+    assert scoped["subtitle_id"] != room_level["subtitle_id"]
+
+
+def test_subtitle_scope_must_exist(client):
+    room = _create_room(client)
+    response = _upload(client, room, media_id="media_missing")
+    assert response.status_code == 404
+    assert response.json()["code"] == "MEDIA_NOT_FOUND"
+
+
+def test_selecting_subtitle_of_other_media_is_rejected(client):
+    room = _create_room(client)
+    scoped = _upload(client, room, media_id=room["media_id"]).json()
+    second_media = _add_item(client, room)
+    _activate(client, room, second_media)
+
+    with client.websocket_connect(f"/hall/ws/{room['room_id']}") as host:
+        host.send_json({"type": "auth", "role": "host", "token": room["host_token"]})
+        assert host.receive_json()["type"] == "auth_ok"
+        host.send_json(
+            {"type": "subtitle_select", "subtitle_id": scoped["subtitle_id"], "visible": True}
+        )
+        error = None
+        for _ in range(10):
+            message = host.receive_json()
+            if message.get("type") == "error":
+                error = message
+                break
+        assert error is not None
+        assert error["code"] == "SUBTITLE_NOT_FOUND"
+
+
+def test_removing_playlist_item_drops_its_subtitles(client):
+    room = _create_room(client)
+    second_media = _add_item(client, room)
+    _activate(client, room, second_media)
+    scoped = _upload(client, room, media_id=second_media).json()
+    room_level = _upload(client, room).json()
+    assert _room_info(client, room)["active_subtitle_id"] == scoped["subtitle_id"]
+
+    response = client.delete(
+        f"/hall/api/rooms/{room['room_id']}/playlist/{second_media}",
+        headers={"X-Host-Token": room["host_token"]},
+    )
+    assert response.status_code == 200, response.text
+
+    info = _room_info(client, room)
+    ids = [item["subtitle_id"] for item in info["subtitles"]]
+    assert scoped["subtitle_id"] not in ids
+    assert room_level["subtitle_id"] in ids
+    assert info["active_subtitle_id"] is None
+    assert client.get(scoped["url"]).status_code == 404

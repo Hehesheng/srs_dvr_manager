@@ -138,6 +138,8 @@ class Room:
         # any response still streaming from the old file stop quietly.
         self.new_generation()
         self.timeline = HostTimeline()
+        self.reset_inactive_subtitle()
+        self.auto_activate_scoped_subtitle()
         self.touch()
 
     def clear_media(self) -> None:
@@ -150,6 +152,7 @@ class Room:
         self.cache = BlockCache(block_size, cache_bytes)
         self.new_generation()
         self.timeline = HostTimeline()
+        self.reset_inactive_subtitle()
         self.touch()
 
     # -- playlist ------------------------------------------------------
@@ -291,10 +294,48 @@ class Room:
 
     # -- subtitles -----------------------------------------------------
     def subtitle_list(self) -> List[Dict[str, Any]]:
+        """Subtitles that apply to the current media.
+
+        Room-level uploads (``media_id`` empty) are always listed; tracks pulled
+        out of a playlist item only show up while that item is playing.
+        """
+        current = self.media.media_id if self.media else None
         return [
             subtitle.public(self.hall.auth.subtitle_url(self.room_id, subtitle.subtitle_id))
             for subtitle in self.subtitles.values()
+            if subtitle.media_id is None or subtitle.media_id == current
         ]
+
+    def subtitle_available(self, subtitle_id: str) -> bool:
+        subtitle = self.subtitles.get(subtitle_id)
+        if subtitle is None:
+            return False
+        current = self.media.media_id if self.media else None
+        return subtitle.media_id is None or subtitle.media_id == current
+
+    def drop_subtitles_for(self, media_id: str) -> None:
+        for subtitle_id, subtitle in list(self.subtitles.items()):
+            if subtitle.media_id == media_id:
+                self.subtitles.pop(subtitle_id, None)
+        self.reset_inactive_subtitle()
+
+    def auto_activate_scoped_subtitle(self) -> None:
+        """Show a track that belongs to the media now playing, if any."""
+        if self.active_subtitle_id is not None or self.media is None:
+            return
+        for subtitle in self.subtitles.values():
+            if subtitle.media_id == self.media.media_id:
+                self.active_subtitle_id = subtitle.subtitle_id
+                self.active_subtitle_visible = True
+                return
+
+    def reset_inactive_subtitle(self) -> None:
+        """Forget the active subtitle once it no longer fits the current media."""
+        if self.active_subtitle_id is None:
+            return
+        if not self.subtitle_available(self.active_subtitle_id):
+            self.active_subtitle_id = None
+            self.active_subtitle_visible = True
 
     def clear_subtitles(self) -> None:
         self.subtitles.clear()

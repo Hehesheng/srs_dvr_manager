@@ -4,7 +4,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 SUPPORTED_FORMATS = ("vtt", "srt")
 UNSUPPORTED_FORMATS = ("ass", "ssa")
@@ -27,6 +27,9 @@ class Subtitle:
     data: bytes
     size: int
     created_at: float = field(default_factory=time.time)
+    # Subtitle tracks extracted from one playlist item stay scoped to it; a
+    # room-level upload leaves this empty and is offered for every item.
+    media_id: Optional[str] = None
 
     @property
     def format(self) -> str:
@@ -40,6 +43,7 @@ class Subtitle:
             "format": self.format,
             "size": self.size,
             "url": url,
+            "media_id": self.media_id,
         }
 
 

@@ -41,7 +41,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_subtitle_bytes": 10 * 1024 * 1024,
 }
 ENDED_ROOM_GRACE = 60.0
-MAX_SUBTITLES_PER_ROOM = 10
+# Embedded tracks are uploaded per playlist item, so a long playlist needs room
+# for several extra entries on top of the subtitles the host uploads by hand.
+MAX_SUBTITLES_PER_ROOM = 32
 MAX_PLAYLIST_ITEMS = 100
 # Re-send the projected host timeline once a second.  Members otherwise only
 # hear about changes, so any silence (seek, pause, stale tab) would leave them
@@ -383,6 +385,8 @@ class HallManager:
         following = room.following_item_id(media_id) if was_active else None
         if not room.remove_playlist_item(media_id):
             raise HallError("media not found", protocol.ERR_MEDIA_NOT_FOUND, 404)
+        # Subtitles extracted from the removed item have nothing left to play on.
+        room.drop_subtitles_for(media_id)
         if was_active:
             next_media = room.playlist.get(following) if following else None
             if next_media is not None:
@@ -407,8 +411,21 @@ class HallManager:
         await self.broadcast_room(room)
         return member
 
+    @staticmethod
+    def _room_has_media(room: Room, media_id: str) -> bool:
+        """A room can hold media outside its playlist: the one it opened with."""
+        if media_id in room.playlist:
+            return True
+        return room.media is not None and room.media.media_id == media_id
+
     async def add_subtitle(
-        self, room: Room, host_token: str, name: str, lang: str, data: bytes
+        self,
+        room: Room,
+        host_token: str,
+        name: str,
+        lang: str,
+        data: bytes,
+        media_id: Optional[str] = None,
     ) -> Subtitle:
         if host_token != room.host_token:
             raise HallError("invalid host token", protocol.ERR_FORBIDDEN, 403)
@@ -429,6 +446,11 @@ class HallManager:
                 409,
             )
 
+        # Tracks extracted from a playlist item belong to that item; a bare
+        # upload is room level and applies to whatever is playing.
+        if media_id is not None and not self._room_has_media(room, media_id):
+            raise HallError("media not found", protocol.ERR_MEDIA_NOT_FOUND, 404)
+
         clean_name = sanitize_name(name)
         try:
             converted = convert_subtitle(clean_name, data)
@@ -441,9 +463,13 @@ class HallManager:
             lang=sanitize_lang(lang),
             data=converted,
             size=len(converted),
+            media_id=media_id,
         )
         room.subtitles[subtitle.subtitle_id] = subtitle
-        if room.active_subtitle_id is None:
+        # Show the first subtitle of whatever is playing right now, so tracks
+        # pulled out of a freshly added file appear without extra clicks.
+        current = room.media.media_id if room.media else None
+        if room.active_subtitle_id is None and media_id in (None, current):
             room.active_subtitle_id = subtitle.subtitle_id
             room.active_subtitle_visible = True
         await self.broadcast_room(room)
@@ -472,7 +498,7 @@ class HallManager:
     async def select_subtitle(
         self, room: Room, subtitle_id: Optional[str], visible: bool
     ) -> None:
-        if subtitle_id is not None and subtitle_id not in room.subtitles:
+        if subtitle_id is not None and not room.subtitle_available(subtitle_id):
             raise HallError("subtitle not found", protocol.ERR_SUBTITLE_NOT_FOUND, 404)
         room.active_subtitle_id = subtitle_id
         room.active_subtitle_visible = bool(visible) if subtitle_id else True

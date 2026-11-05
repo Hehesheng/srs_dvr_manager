@@ -284,6 +284,7 @@ async def upload_subtitle(
     request: Request,
     name: str = Query(default="subtitles.srt"),
     lang: str = Query(default="und"),
+    media_id: Optional[str] = Query(default=None),
     x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
 ):
     hall = _hall(request)
@@ -309,7 +310,7 @@ async def upload_subtitle(
         )
 
     try:
-        subtitle = await hall.add_subtitle(room, token, name, lang, data)
+        subtitle = await hall.add_subtitle(room, token, name, lang, data, media_id)
     except HallError as exc:
         return _hall_error(exc)
     return {
@@ -319,6 +320,7 @@ async def upload_subtitle(
         "format": subtitle.format,
         "size": subtitle.size,
         "url": hall.auth.subtitle_url(room.room_id, subtitle.subtitle_id),
+        "media_id": subtitle.media_id,
         "active_subtitle_id": room.active_subtitle_id,
     }
 
