@@ -1,5 +1,6 @@
 """Room, member and media data structures."""
 
+import asyncio
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -11,6 +12,13 @@ from .host_source import HostSource, SourceOffline
 from .subtitles import Subtitle
 from .timeline import HostTimeline
 from .upstream import UpstreamSource
+
+
+# How long a block read may wait for the host plane to load the media the room
+# just switched to.  The host announces ``media_ready`` once its worker holds
+# the new file; reads issued before that would otherwise be answered with bytes
+# from the previous file under the new media id.
+HOST_MEDIA_READY_TIMEOUT = 5.0
 
 
 def _wall_ms() -> float:
@@ -92,6 +100,10 @@ class Room:
         self.host_online = False
         self.host_connected_at = 0.0
         self.gen = 0
+        # Media the host worker currently holds, and whether this host knows to
+        # announce it (older clients do not, so their reads are not gated).
+        self.host_media_id: Optional[str] = None
+        self.host_media_capable = False
 
         self.timeline = HostTimeline()
         self.cache = BlockCache(block_size, cache_bytes)
@@ -120,6 +132,7 @@ class Room:
         cache_bytes = self.cache.max_bytes
         self.media = media
         self.upstream = upstream
+        self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         # In-flight host reads belong to the old media; failing them also makes
         # any response still streaming from the old file stop quietly.
@@ -133,6 +146,7 @@ class Room:
         cache_bytes = self.cache.max_bytes
         self.media = None
         self.upstream = None
+        self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         self.new_generation()
         self.timeline = HostTimeline()
@@ -203,6 +217,8 @@ class Room:
         self.host_ws = ws
         self.host_online = True
         self.host_connected_at = time.time()
+        # A (re)connected worker has to tell us which media it holds.
+        self.host_media_id = None
         self.host_source.attach(ws)
         self.touch()
 
@@ -211,8 +227,42 @@ class Room:
             return
         self.host_ws = None
         self.host_online = False
+        self.host_media_id = None
         self.host_source.detach()
         self.touch()
+
+    # -- host media plane ---------------------------------------------
+    def mark_host_media(self, media_id: Optional[str]) -> None:
+        """Remember which media the host worker now serves."""
+        self.host_media_id = str(media_id) if media_id else None
+        self.touch()
+
+    def _host_media_ready(self) -> bool:
+        if self.media is None or self.media.kind != "host_file":
+            return True
+        if not self.host_media_capable:
+            # Legacy host: it never announces, so gate nothing.
+            return True
+        return self.host_media_id == self.media.media_id
+
+    async def wait_host_media(self, timeout: Optional[float] = None) -> bool:
+        """Wait until the host worker serves the media the room is pointing at.
+
+        Without this the first reads after a playlist switch are answered from
+        the previous file (under the new media id) and get cached, which makes
+        the member's player fail permanently instead of recovering on retry.
+        """
+        if self._host_media_ready():
+            return True
+        if timeout is None:
+            timeout = HOST_MEDIA_READY_TIMEOUT
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(0.02)
+            if self._host_media_ready():
+                return True
+        return self._host_media_ready()
 
     # -- blocks --------------------------------------------------------
     async def load_block(self, index: int) -> bytes:
@@ -228,6 +278,10 @@ class Room:
             if self.upstream is None:
                 raise SourceOffline("upstream is not configured")
             return await self.upstream.read(offset, length)
+        # After a playlist switch the host needs a moment to hand the new file
+        # to its worker; reading before that returns the previous file's bytes.
+        if not await self.wait_host_media():
+            raise SourceOffline("host has not switched to the requested media")
         return await self.host_source.read(offset, length, self.gen)
 
     async def get_block(self, index: int) -> bytes:

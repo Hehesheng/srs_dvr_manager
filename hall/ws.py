@@ -56,6 +56,8 @@ async def _authenticate(ws: WebSocket, room: Room, payload: Dict[str, Any]) -> O
                 await previous.close(code=4001, reason="replaced by a new host connection")
             except Exception:
                 pass
+        caps = payload.get("capabilities")
+        room.host_media_capable = isinstance(caps, list) and "media_ready" in caps
         room.new_generation()
         room.set_host(ws)
         return "host"
@@ -210,6 +212,9 @@ async def _handle_host_message(ws: WebSocket, room: Room, hall: HallManager, msg
             await hall.select_subtitle(room, subtitle_id, visible)
         except HallError as exc:
             await _send_error(ws, exc.code, exc.message)
+        return
+    if kind == protocol.MSG_MEDIA_READY:
+        room.mark_host_media(msg.get("media_id"))
         return
     if kind == protocol.MSG_FLOW:
         try:

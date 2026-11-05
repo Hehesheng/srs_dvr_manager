@@ -33,6 +33,7 @@ MSG_STATUS = "status"
 MSG_PING = "ping"
 MSG_FLOW = "flow"
 MSG_SUBTITLE_SELECT = "subtitle_select"
+MSG_MEDIA_READY = "media_ready"
 
 # Server -> client
 MSG_AUTH_OK = "auth_ok"
