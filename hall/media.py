@@ -1,11 +1,16 @@
 """HTTP Range parsing and streaming helpers for hall media."""
 
+import asyncio
 from dataclasses import dataclass
-from typing import AsyncIterator, Dict, Optional
+from typing import AsyncIterator, Dict, Optional, Tuple
 
 from starlette.requests import Request
 
 DEFAULT_MAX_OPEN_RANGE = 8 * 1024 * 1024
+# A member stream consumes blocks strictly in order, but every block is a
+# round trip to the host browser.  Read a few blocks ahead so that latency is
+# overlapped instead of capping throughput at one block per RTT.
+PREFETCH_BLOCKS = 4
 
 
 class RangeError(ValueError):
@@ -99,6 +104,53 @@ def unsatisfiable_headers(total: int) -> Dict[str, str]:
     }
 
 
+def _ignore_result(task: "asyncio.Task[bytes]") -> None:
+    # Prefetches that are cancelled or abandoned must not log "exception was
+    # never retrieved"; awaiting the task later still raises normally.
+    if not task.cancelled():
+        task.exception()
+
+
+async def _iter_blocks(
+    room,
+    request: Request,
+    first_index: int,
+    last_index: int,
+    prefetch: int = PREFETCH_BLOCKS,
+) -> AsyncIterator[Tuple[int, bytes]]:
+    pending: Dict[int, "asyncio.Task[bytes]"] = {}
+    next_index = first_index
+
+    def schedule() -> None:
+        nonlocal next_index
+        while next_index <= last_index and len(pending) < prefetch:
+            task = asyncio.ensure_future(room.get_block(next_index))
+            task.add_done_callback(_ignore_result)
+            pending[next_index] = task
+            next_index += 1
+
+    try:
+        schedule()
+        index = first_index
+        while index <= last_index:
+            task = pending.pop(index, None)
+            if task is None:
+                task = asyncio.ensure_future(room.get_block(index))
+                task.add_done_callback(_ignore_result)
+            block = await task
+            if not block:
+                return
+            yield index, block
+            index += 1
+            schedule()
+            if await request.is_disconnected():
+                return
+    finally:
+        for task in pending.values():
+            if not task.done():
+                task.cancel()
+
+
 async def stream_range(
     room,
     request: Request,
@@ -106,11 +158,9 @@ async def stream_range(
     block_size: int,
 ) -> AsyncIterator[bytes]:
     position = byte_range.start
-    while position <= byte_range.end:
-        index = position // block_size
-        block = await room.get_block(index)
-        if not block:
-            return
+    first_index = byte_range.start // block_size
+    last_index = byte_range.end // block_size
+    async for index, block in _iter_blocks(room, request, first_index, last_index):
         block_start = index * block_size
         offset = position - block_start
         available = len(block) - offset
@@ -121,18 +171,10 @@ async def stream_range(
         if chunk:
             yield chunk
         position += len(chunk)
-        if await request.is_disconnected():
-            return
 
 
 async def stream_full(room, request: Request, block_size: int) -> AsyncIterator[bytes]:
     total = room.media.size
-    index = 0
-    while index * block_size < total:
-        block = await room.get_block(index)
-        if not block:
-            return
+    last_index = (total - 1) // block_size if total > 0 else -1
+    async for _, block in _iter_blocks(room, request, 0, last_index):
         yield block
-        index += 1
-        if await request.is_disconnected():
-            return
