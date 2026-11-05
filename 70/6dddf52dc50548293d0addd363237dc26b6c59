@@ -1,0 +1,34 @@
+README.md
+  s_770a1ef0e88ba4::t_617ee45a3fc3df 451
+  s_770a1ef0e88ba4::t_a8c969dbfa1cc9 381-387
+  s_770a1ef0e88ba4::t_9d2d9ca5eef906 43-46
+  s_770a1ef0e88ba4::t_488098316af6b5 372-373
+  s_770a1ef0e88ba4::t_7995f3d9c10e6a 397,400-407,415
+dvr/webdav_client.py
+  s_770a1ef0e88ba4::t_ca586751793c6b 11
+api.py
+  s_770a1ef0e88ba4::t_31c65efc648d73 2,7-8,11-12,20,31-36,38-40,48,53-54
+dvr/router.py
+  s_770a1ef0e88ba4::t_4c7ecf0d44e467 1-104
+dvr/record_manager.py
+  s_770a1ef0e88ba4::t_ec6bd631acd5d7 12-13,15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "706dddf52dc50548293d0addd363237dc26b6c59",
+  "prompts": {},
+  "logical_commit_id": "706dddf52dc50548293d0addd363237dc26b6c59",
+  "sessions": {
+    "s_770a1ef0e88ba4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6e2ebc7f-90b5-47f0-b942-a3637fef6733",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "huanghuisheng <huanghuisheng@bigo.sg>",
+      "total_additions": 150,
+      "total_deletions": 120
+    }
+  }
+}
