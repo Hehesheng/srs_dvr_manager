@@ -22,13 +22,14 @@ def clock(monkeypatch):
     return fake
 
 
-def _state(seq=0, position=0.0, rate=1.0, playing=True, buffering=False):
+def _state(seq=0, position=0.0, rate=1.0, playing=True, buffering=False, background=False):
     return {
         "seq": seq,
         "position": position,
         "rate": rate,
         "playing": playing,
         "buffering": buffering,
+        "background": background,
     }
 
 
@@ -113,6 +114,31 @@ def test_silent_host_freezes_and_marks_buffering(clock):
     assert snapshot["stale"] is False
     assert snapshot["buffering"] is False
     assert snapshot["position"] == pytest.approx(14.0)
+
+
+def test_hidden_host_keeps_projecting(clock):
+    timeline = HostTimeline()
+    timeline.update(_state(position=10.0))
+    clock.advance(1.0)
+    # The host switched tabs: still playing, but only visibility changed.
+    assert timeline.update(_state(position=11.0, background=True)) == ["state"]
+    assert timeline.snapshot()["background"] is True
+
+    # Timer throttling silences heartbeats for a long time; members must not
+    # see a stale/buffering host while the host tab is merely hidden.
+    clock.advance(600.0)
+    snapshot = timeline.snapshot()
+    assert snapshot["stale"] is False
+    assert snapshot["buffering"] is False
+    assert snapshot["playing"] is True
+    assert snapshot["position"] == pytest.approx(611.0, abs=0.01)
+
+    # Returning to the foreground restores the short stale threshold.
+    assert timeline.update(_state(position=611.1, background=False)) == ["state"]
+    clock.advance(3.0)
+    snapshot = timeline.snapshot()
+    assert snapshot["stale"] is True
+    assert snapshot["buffering"] is True
 
 
 def test_repeated_large_error_triggers_resync(clock):

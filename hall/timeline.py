@@ -24,8 +24,10 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 # If the host tab is throttled or frozen, heartbeats stop arriving while the
 # websocket stays open.  Stop projecting after a few missed beats so members
-# pause instead of chasing an invented position.
+# pause instead of chasing an invented position.  A host that told us it is
+# merely hidden keeps playing, so its timeline is trusted much longer.
 HOST_STALE_SECONDS = 2.5
+HOST_BACKGROUND_STALE_SECONDS = 6 * 3600
 
 
 class HostTimeline:
@@ -36,6 +38,7 @@ class HostTimeline:
         self.rate = 1.0
         self.playing = False
         self.buffering = False
+        self.background = False
         self.updated_mono = now
         self.updated_wall = _wall_ms()
         self._bad_count = 0
@@ -47,6 +50,7 @@ class HostTimeline:
         self.rate = _clamp(float(msg.get("rate", self.rate)), 0.25, 4.0)
         self.playing = bool(msg.get("playing", self.playing))
         self.buffering = bool(msg.get("buffering", self.buffering))
+        self.background = bool(msg.get("background", self.background))
         self.updated_mono = now_mono
         self.updated_wall = now_wall
 
@@ -88,10 +92,17 @@ class HostTimeline:
         buffering = bool(msg.get("buffering", self.buffering))
         rate = _clamp(float(msg.get("rate", self.rate)), 0.25, 4.0)
 
-        if playing != self.playing or buffering != self.buffering or abs(rate - self.rate) > 1e-6:
+        background = bool(msg.get("background", self.background))
+        if (
+            playing != self.playing
+            or buffering != self.buffering
+            or background != self.background
+            or abs(rate - self.rate) > 1e-6
+        ):
             self.position = observed
             self.playing = playing
             self.buffering = buffering
+            self.background = background
             self.rate = rate
             self.updated_mono = now_mono
             self.updated_wall = now_wall
@@ -135,10 +146,11 @@ class HostTimeline:
         now_mono = _monotonic_ms()
         now_wall = _wall_ms()
         elapsed = (now_mono - self.updated_mono) / 1000.0
-        stale = self.playing and not self.buffering and elapsed > HOST_STALE_SECONDS
+        limit = HOST_BACKGROUND_STALE_SECONDS if self.background else HOST_STALE_SECONDS
+        stale = self.playing and not self.buffering and elapsed > limit
         position = self.position
         if self.playing and not self.buffering:
-            position += min(max(0.0, elapsed), HOST_STALE_SECONDS) * self.rate
+            position += min(max(0.0, elapsed), limit) * self.rate
         return {
             "seq": self.seq,
             "position": round(max(0.0, position), 3),
@@ -146,6 +158,7 @@ class HostTimeline:
             "playing": self.playing,
             "buffering": self.buffering or stale,
             "stale": stale,
+            "background": self.background,
             "updated_at": round(now_wall, 3),
             "server_ts": round(now_wall, 3),
         }
@@ -157,5 +170,6 @@ class HostTimeline:
             "rate": round(self.rate, 3),
             "playing": self.playing,
             "buffering": self.buffering,
+            "background": self.background,
             "updated_at": round(self.updated_wall, 3),
         }
