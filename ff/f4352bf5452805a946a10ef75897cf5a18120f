@@ -1,0 +1,27 @@
+hall/rooms.py
+  s_856b7f4314a1d9::t_cf15f8f31c2c75 204-215
+hall/manager.py
+  s_856b7f4314a1d9::t_694950612ea29d 186-191
+hall/router.py
+  s_856b7f4314a1d9::t_914ee60e4cd5ec 65-72
+tests/test_hall_api.py
+  s_856b7f4314a1d9::t_270eee14e86307 112-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "fff4352bf5452805a946a10ef75897cf5a18120f",
+  "prompts": {},
+  "logical_commit_id": "fff4352bf5452805a946a10ef75897cf5a18120f",
+  "sessions": {
+    "s_856b7f4314a1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d0d1cf1-5130-42fb-b5ed-d7fea40259ed",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "huanghuisheng <huanghuisheng@bigo.sg>",
+      "total_additions": 65
+    }
+  }
+}
