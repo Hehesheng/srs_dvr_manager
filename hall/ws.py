@@ -9,13 +9,21 @@ from typing import Any, Dict, Optional
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import protocol
-from .manager import HallManager
+from .manager import HallError, HallManager
 from .rooms import Member, Room
 
 logger = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 10.0
-READONLY_MESSAGES = {"seek", "play", "pause", "ratechange", "state", "end"}
+READONLY_MESSAGES = {
+    "seek",
+    "play",
+    "pause",
+    "ratechange",
+    "state",
+    "end",
+    protocol.MSG_SUBTITLE_SELECT,
+}
 
 
 def _wall_ms() -> int:
@@ -192,6 +200,15 @@ async def _handle_host_message(ws: WebSocket, room: Room, hall: HallManager, msg
     if kind == protocol.MSG_END:
         room.timeline.mark_ended()
         await hall.broadcast_host_event(room, "state")
+        return
+    if kind == protocol.MSG_SUBTITLE_SELECT:
+        raw_id = msg.get("subtitle_id")
+        subtitle_id = str(raw_id) if raw_id else None
+        visible = bool(msg.get("visible", True))
+        try:
+            await hall.select_subtitle(room, subtitle_id, visible)
+        except HallError as exc:
+            await _send_error(ws, exc.code, exc.message)
         return
     if kind == protocol.MSG_FLOW:
         try:

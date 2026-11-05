@@ -7,6 +7,7 @@ from fastapi import APIRouter, Header, Query, Request, WebSocket, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import protocol
 from .host_source import HostSourceError
 from .manager import HallError, HallManager
 from .media import (
@@ -136,6 +137,124 @@ async def end_room(
     except HallError as exc:
         return _hall_error(exc)
     return {"code": 0, "ended": True}
+
+
+class _UploadTooLarge(Exception):
+    pass
+
+
+async def _read_upload(request: Request, limit: int) -> bytes:
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > limit:
+                raise _UploadTooLarge()
+        except ValueError:
+            pass
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise _UploadTooLarge()
+        body.extend(chunk)
+    return bytes(body)
+
+
+@router.post("/api/rooms/{room_ref}/subtitles")
+async def upload_subtitle(
+    room_ref: str,
+    request: Request,
+    name: str = Query(default="subtitles.srt"),
+    lang: str = Query(default="und"),
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    if room.ended:
+        return _error_json(status.HTTP_410_GONE, protocol.ERR_ROOM_ENDED, "room has ended")
+
+    token = x_host_token or ""
+    if token != room.host_token:
+        return _error_json(status.HTTP_403_FORBIDDEN, protocol.ERR_FORBIDDEN, "only the host can upload subtitles")
+
+    try:
+        data = await _read_upload(request, hall.config.max_subtitle_bytes)
+    except _UploadTooLarge:
+        return _error_json(
+            413,
+            protocol.ERR_SUBTITLE_TOO_LARGE,
+            f"subtitle is larger than {hall.config.max_subtitle_bytes} bytes",
+        )
+
+    try:
+        subtitle = await hall.add_subtitle(room, token, name, lang, data)
+    except HallError as exc:
+        return _hall_error(exc)
+    return {
+        "subtitle_id": subtitle.subtitle_id,
+        "name": subtitle.name,
+        "lang": subtitle.lang,
+        "format": subtitle.format,
+        "size": subtitle.size,
+        "url": hall.auth.subtitle_url(room.room_id, subtitle.subtitle_id),
+        "active_subtitle_id": room.active_subtitle_id,
+    }
+
+
+@router.delete("/api/rooms/{room_ref}/subtitles/{subtitle_id}")
+async def delete_subtitle(
+    room_ref: str,
+    subtitle_id: str,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        await hall.delete_subtitle(room, subtitle_id, x_host_token or "")
+    except HallError as exc:
+        return _hall_error(exc)
+    return {"code": 0, "deleted": True}
+
+
+@router.get("/subtitles/{room_ref}/{subtitle_id}.vtt")
+async def get_subtitle(
+    room_ref: str,
+    subtitle_id: str,
+    request: Request,
+    exp: int = Query(...),
+    sig: str = Query(...),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    if room.ended:
+        return _error_json(status.HTTP_410_GONE, protocol.ERR_ROOM_ENDED, "room has ended")
+    subtitle = room.subtitles.get(subtitle_id)
+    if subtitle is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_SUBTITLE_NOT_FOUND, "subtitle not found")
+    if not hall.auth.verify_subtitle(room.room_id, subtitle_id, exp, sig):
+        return _error_json(
+            status.HTTP_403_FORBIDDEN, protocol.ERR_SIGNATURE, "subtitle URL is invalid or expired"
+        )
+    return Response(
+        content=subtitle.data,
+        media_type="text/vtt; charset=utf-8",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
 
 
 @router.websocket("/ws/{room_ref}")

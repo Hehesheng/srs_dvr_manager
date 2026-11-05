@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from .auth import HallAuth
 from .cache import BlockCache
 from .host_source import HostSource, SourceOffline
+from .subtitles import Subtitle
 from .timeline import HostTimeline
 from .upstream import UpstreamSource
 
@@ -96,6 +97,9 @@ class Room:
         self.upstream = upstream
         self.members: Dict[str, Member] = {}
         self.member_tokens: Dict[str, str] = {}
+        self.subtitles: Dict[str, Subtitle] = {}
+        self.active_subtitle_id: Optional[str] = None
+        self.active_subtitle_visible: bool = True
 
     # -- lifecycle -----------------------------------------------------
     def touch(self) -> None:
@@ -163,6 +167,18 @@ class Room:
         self.hall.enforce_global_cache()
         return data
 
+    # -- subtitles -----------------------------------------------------
+    def subtitle_list(self) -> List[Dict[str, Any]]:
+        return [
+            subtitle.public(self.hall.auth.subtitle_url(self.room_id, subtitle.subtitle_id))
+            for subtitle in self.subtitles.values()
+        ]
+
+    def clear_subtitles(self) -> None:
+        self.subtitles.clear()
+        self.active_subtitle_id = None
+        self.active_subtitle_visible = True
+
     # -- snapshots -----------------------------------------------------
     def host_snapshot(self) -> Dict[str, Any]:
         snapshot = self.timeline.snapshot()
@@ -179,6 +195,9 @@ class Room:
             "media": self.media.public(),
             "host": self.host_snapshot(),
             "members": [m.public() for m in self.members.values()],
+            "subtitles": self.subtitle_list(),
+            "active_subtitle_id": self.active_subtitle_id,
+            "active_subtitle_visible": self.active_subtitle_visible,
             "ended": self.ended,
         }
 
@@ -192,6 +211,9 @@ class Room:
             "host": self.host_snapshot(),
             "member_count": self.member_count(),
             "members": [m.public() for m in self.members.values()],
+            "subtitles": self.subtitle_list(),
+            "active_subtitle_id": self.active_subtitle_id,
+            "active_subtitle_visible": self.active_subtitle_visible,
             "cache": {
                 "bytes": self.cache.bytes_used,
                 "hits": self.cache.hits,

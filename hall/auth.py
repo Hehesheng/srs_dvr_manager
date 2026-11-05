@@ -77,3 +77,21 @@ class HallAuth:
             return False
         expected = self._sign(room_id, media_id, exp)
         return hmac.compare_digest(expected, sig or "")
+
+    # Subtitles use a separate signing context so a media URL signature can
+    # never be replayed against the subtitle endpoint (or vice versa).
+    def subtitle_signature(self, room_id: str, subtitle_id: str, exp: int) -> str:
+        message = f"subtitle:{room_id}:{subtitle_id}:{exp}".encode("utf-8")
+        return hmac.new(self._secret, message, hashlib.sha256).hexdigest()
+
+    def subtitle_url(self, room_id: str, subtitle_id: str, exp: Optional[int] = None) -> str:
+        if exp is None:
+            exp = int(time.time()) + self.media_url_ttl
+        sig = self.subtitle_signature(room_id, subtitle_id, exp)
+        return f"/hall/subtitles/{room_id}/{subtitle_id}.vtt?exp={exp}&sig={sig}"
+
+    def verify_subtitle(self, room_id: str, subtitle_id: str, exp: int, sig: str) -> bool:
+        if exp < int(time.time()):
+            return False
+        expected = self.subtitle_signature(room_id, subtitle_id, exp)
+        return hmac.compare_digest(expected, sig or "")

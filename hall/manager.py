@@ -13,6 +13,13 @@ import yaml
 from . import protocol
 from .auth import HallAuth
 from .rooms import MediaInfo, Member, Room
+from .subtitles import (
+    Subtitle,
+    SubtitleFormatError,
+    convert_subtitle,
+    sanitize_lang,
+    sanitize_name,
+)
 from .upstream import UpstreamError, UpstreamSource, probe_url
 
 logger = logging.getLogger(__name__)
@@ -30,8 +37,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "member_idle_timeout": 600,
     "media_url_ttl": 86400,
     "max_media_bytes": 64 * 1024 * 1024 * 1024,
+    "max_subtitle_bytes": 10 * 1024 * 1024,
 }
 ENDED_ROOM_GRACE = 60.0
+MAX_SUBTITLES_PER_ROOM = 10
 # Re-send the projected host timeline once a second.  Members otherwise only
 # hear about changes, so any silence (seek, pause, stale tab) would leave them
 # extrapolating from an old anchor.
@@ -64,6 +73,7 @@ class HallConfig:
     member_idle_timeout: float = 600
     media_url_ttl: int = 86400
     max_media_bytes: int = 64 * 1024 * 1024 * 1024
+    max_subtitle_bytes: int = 10 * 1024 * 1024
     signing_secret: str = ""
 
     @classmethod
@@ -90,6 +100,7 @@ class HallConfig:
             member_idle_timeout=max(60.0, float(merged["member_idle_timeout"])),
             media_url_ttl=max(60, int(merged["media_url_ttl"])),
             max_media_bytes=max(1024 * 1024, int(merged["max_media_bytes"])),
+            max_subtitle_bytes=max(1024, int(merged["max_subtitle_bytes"])),
             signing_secret=str(merged.get("signing_secret") or ""),
         )
 
@@ -266,6 +277,83 @@ class HallManager:
         await self.broadcast_room(room)
         return member
 
+    async def add_subtitle(
+        self, room: Room, host_token: str, name: str, lang: str, data: bytes
+    ) -> Subtitle:
+        if host_token != room.host_token:
+            raise HallError("invalid host token", protocol.ERR_FORBIDDEN, 403)
+        if room.ended:
+            raise HallError("room has ended", protocol.ERR_ROOM_ENDED, 410)
+        if len(data) > self.config.max_subtitle_bytes:
+            raise HallError(
+                f"subtitle exceeds {self.config.max_subtitle_bytes} bytes",
+                protocol.ERR_SUBTITLE_TOO_LARGE,
+                413,
+            )
+        if not data:
+            raise HallError("subtitle is empty", protocol.ERR_BAD_MESSAGE, 400)
+        if len(room.subtitles) >= MAX_SUBTITLES_PER_ROOM:
+            raise HallError(
+                f"at most {MAX_SUBTITLES_PER_ROOM} subtitles per room",
+                protocol.ERR_TOO_MANY_SUBTITLES,
+                409,
+            )
+
+        clean_name = sanitize_name(name)
+        try:
+            converted = convert_subtitle(clean_name, data)
+        except SubtitleFormatError as exc:
+            raise HallError(str(exc), protocol.ERR_SUBTITLE_FORMAT, 415)
+
+        subtitle = Subtitle(
+            subtitle_id="sub_" + os.urandom(8).hex(),
+            name=clean_name,
+            lang=sanitize_lang(lang),
+            data=converted,
+            size=len(converted),
+        )
+        room.subtitles[subtitle.subtitle_id] = subtitle
+        if room.active_subtitle_id is None:
+            room.active_subtitle_id = subtitle.subtitle_id
+            room.active_subtitle_visible = True
+        await self.broadcast_room(room)
+        logger.info(
+            "Subtitle added room=%s id=%s name=%s size=%d",
+            room.room_id,
+            subtitle.subtitle_id,
+            subtitle.name,
+            subtitle.size,
+        )
+        return subtitle
+
+    async def delete_subtitle(self, room: Room, subtitle_id: str, host_token: str) -> None:
+        if host_token != room.host_token:
+            raise HallError("invalid host token", protocol.ERR_FORBIDDEN, 403)
+        if room.ended:
+            raise HallError("room has ended", protocol.ERR_ROOM_ENDED, 410)
+        if room.subtitles.pop(subtitle_id, None) is None:
+            raise HallError("subtitle not found", protocol.ERR_SUBTITLE_NOT_FOUND, 404)
+        if room.active_subtitle_id == subtitle_id:
+            room.active_subtitle_id = None
+            room.active_subtitle_visible = True
+        await self.broadcast_room(room)
+        logger.info("Subtitle removed room=%s id=%s", room.room_id, subtitle_id)
+
+    async def select_subtitle(
+        self, room: Room, subtitle_id: Optional[str], visible: bool
+    ) -> None:
+        if subtitle_id is not None and subtitle_id not in room.subtitles:
+            raise HallError("subtitle not found", protocol.ERR_SUBTITLE_NOT_FOUND, 404)
+        room.active_subtitle_id = subtitle_id
+        room.active_subtitle_visible = bool(visible) if subtitle_id else True
+        await self.broadcast_room(room)
+        logger.debug(
+            "Subtitle selected room=%s id=%s visible=%s",
+            room.room_id,
+            subtitle_id or "-",
+            room.active_subtitle_visible,
+        )
+
     async def end_room(self, room: Room, host_token: str) -> None:
         if host_token != room.host_token:
             raise HallError("invalid host token", protocol.ERR_FORBIDDEN, 403)
@@ -274,6 +362,7 @@ class HallManager:
         room.ended = True
         room.timeline.mark_ended()
         room.host_source.fail_all()
+        room.clear_subtitles()
         self._ended_at[room.room_id] = time.time()
         await self.broadcast_room(room)
         await self._close_room(room, code=4000, reason="room ended")
