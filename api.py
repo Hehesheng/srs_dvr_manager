@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from dvr.record_manager import WebDavRecordManager
 from dvr.router import router as dvr_router
+from hall.manager import HallManager
+from hall.router import router as hall_router
 
 if not os.path.exists(os.path.dirname(__file__) + "/logs"):
     os.mkdir(os.path.dirname(__file__) + "/logs")
@@ -30,14 +32,22 @@ async def lifespan(app: FastAPI):
     await record_mgr.init()
     app.state.record_mgr = record_mgr
 
-    # Media hall manager will be initialized here once hall/ is implemented.
-    # app.state.hall = HallManager()
-    # await app.state.hall.start()
+    app.state.hall = None
+    try:
+        hall = HallManager.from_config()
+        if hall.enabled:
+            await hall.start()
+            app.state.hall = hall
+        else:
+            logger.info("Media hall is disabled by configuration")
+    except Exception:
+        logger.exception("Media hall initialization failed; hall routes return 503")
 
     yield
 
-    # if app.state.hall is not None:
-    #     await app.state.hall.stop()
+    if getattr(app.state, "hall", None) is not None:
+        await app.state.hall.stop()
+        app.state.hall = None
     await record_mgr.close()
 
 
@@ -52,6 +62,7 @@ app.add_middleware(
 )
 
 app.include_router(dvr_router)
+app.include_router(hall_router)
 
 
 @app.get("/")

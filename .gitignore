@@ -5,3 +5,4 @@ live
 config.yaml
 logs
 .vscode
+hall/.signing_secret
