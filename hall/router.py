@@ -37,7 +37,8 @@ class MediaPayload(BaseModel):
 
 class CreateRoomRequest(BaseModel):
     name: str = Field(default="Media Room", max_length=64)
-    media: MediaPayload
+    # Optional: a host may open the room first and fill the playlist later.
+    media: Optional[MediaPayload] = None
 
 
 class JoinRequest(BaseModel):
@@ -62,6 +63,14 @@ def _hall_error(exc: HallError) -> JSONResponse:
     return _error_json(exc.status_code, exc.code, exc.message)
 
 
+def _media_fields(room, hall: HallManager) -> dict:
+    return {
+        "media_id": room.media.media_id if room.media else None,
+        "media": room.media.public() if room.media else None,
+        "media_url": room.media_url(),
+    }
+
+
 @router.get("/api/rooms")
 async def list_rooms(request: Request):
     hall = _hall(request)
@@ -75,17 +84,16 @@ async def create_room(payload: CreateRoomRequest, request: Request):
     hall = _hall(request)
     if hall is None:
         return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    media_payload = payload.media.model_dump(exclude_none=True) if payload.media else None
     try:
-        room = await hall.create_room(payload.name, payload.media.model_dump(exclude_none=True))
+        room = await hall.create_room(payload.name, media_payload)
     except HallError as exc:
         return _hall_error(exc)
     return {
         "room_id": room.room_id,
         "room_code": room.room_code,
         "host_token": room.host_token,
-        "media_id": room.media.media_id,
-        "media": room.media.public(),
-        "media_url": hall.auth.media_url(room.room_id, room.media.media_id),
+        **_media_fields(room, hall),
         "ws_url": f"/hall/ws/{room.room_id}",
         "room": room.public_info(),
     }
@@ -111,9 +119,84 @@ async def change_media(
     except HallError as exc:
         return _hall_error(exc)
     return {
-        "media_id": room.media.media_id,
-        "media": room.media.public(),
-        "media_url": hall.auth.media_url(room.room_id, room.media.media_id),
+        **_media_fields(room, hall),
+        "playlist": room.playlist_public(),
+        "room": room.public_info(),
+    }
+
+
+@router.post("/api/rooms/{room_ref}/playlist")
+async def add_playlist_item(
+    room_ref: str,
+    payload: MediaPayload,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        media, activated = await hall.add_playlist_media(
+            room, x_host_token or "", payload.model_dump(exclude_none=True)
+        )
+    except HallError as exc:
+        return _hall_error(exc)
+    return {
+        "media_id": media.media_id,
+        "active": activated,
+        **_media_fields(room, hall),
+        "playlist": room.playlist_public(),
+        "room": room.public_info(),
+    }
+
+
+@router.post("/api/rooms/{room_ref}/playlist/{media_id}/activate")
+async def activate_playlist_item(
+    room_ref: str,
+    media_id: str,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        await hall.select_playlist_media(room, x_host_token or "", media_id)
+    except HallError as exc:
+        return _hall_error(exc)
+    return {
+        **_media_fields(room, hall),
+        "playlist": room.playlist_public(),
+        "room": room.public_info(),
+    }
+
+
+@router.delete("/api/rooms/{room_ref}/playlist/{media_id}")
+async def remove_playlist_item(
+    room_ref: str,
+    media_id: str,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        await hall.remove_playlist_media(room, x_host_token or "", media_id)
+    except HallError as exc:
+        return _hall_error(exc)
+    return {
+        **_media_fields(room, hall),
+        "playlist": room.playlist_public(),
         "room": room.public_info(),
     }
 
@@ -135,8 +218,7 @@ async def join_room(room_ref: str, payload: JoinRequest, request: Request):
         "member_id": member.member_id,
         "room_id": room.room_id,
         "room_code": room.room_code,
-        "media": room.media.public(),
-        "media_url": hall.auth.media_url(room.room_id, room.media.media_id),
+        **_media_fields(room, hall),
         "ws_url": f"/hall/ws/{room.room_id}",
         "room": room.public_info(),
     }
@@ -312,7 +394,7 @@ def _media_or_error(request: Request, room_ref: str, media_id: str, exp: int, si
         return None, None, _error_json(status.HTTP_404_NOT_FOUND, "ROOM_NOT_FOUND", "room not found")
     if room.ended:
         return None, None, _error_json(status.HTTP_410_GONE, "ROOM_ENDED", "room has ended")
-    if room.media.media_id != media_id:
+    if room.media is None or room.media.media_id != media_id:
         return None, None, _error_json(status.HTTP_404_NOT_FOUND, "MEDIA_NOT_FOUND", "media not found")
     if not hall.auth.verify_media(room.room_id, media_id, exp, sig):
         return None, None, _error_json(

@@ -41,6 +41,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 ENDED_ROOM_GRACE = 60.0
 MAX_SUBTITLES_PER_ROOM = 10
+MAX_PLAYLIST_ITEMS = 100
 # Re-send the projected host timeline once a second.  Members otherwise only
 # hear about changes, so any silence (seek, pause, stale tab) would leave them
 # extrapolating from an old anchor.
@@ -190,7 +191,9 @@ class HallManager:
         return [room.public_summary() for room in active]
 
     # -- creation / join ----------------------------------------------
-    async def create_room(self, name: str, media_payload: Dict[str, Any]) -> Room:
+    async def create_room(
+        self, name: str, media_payload: Optional[Dict[str, Any]] = None
+    ) -> Room:
         if not self.enabled:
             raise HallError("hall is disabled")
         active = [r for r in self.rooms.values() if not r.ended]
@@ -198,7 +201,10 @@ class HallManager:
             raise HallError("too many rooms", "TOO_MANY_ROOMS", 429)
 
         room_name = (name or "Media Room").strip()[:64] or "Media Room"
-        media, upstream = await self._build_media(media_payload)
+        media: Optional[MediaInfo] = None
+        upstream: Optional[UpstreamSource] = None
+        if media_payload:
+            media, upstream = await self._build_media(media_payload)
 
         room = Room(
             hall=self,
@@ -214,12 +220,11 @@ class HallManager:
         self.rooms[room.room_id] = room
         self._codes[room.room_code] = room.room_id
         logger.info(
-            "Room created id=%s code=%s media=%s size=%d kind=%s",
+            "Room created id=%s code=%s media=%s playlist=%d",
             room.room_id,
             room.room_code,
-            room.media.name,
-            room.media.size,
-            room.media.kind,
+            room.media.name if room.media else "-",
+            len(room.playlist_order),
         )
         return room
 
@@ -281,22 +286,107 @@ class HallManager:
             )
         return media, upstream
 
-    async def change_media(
-        self, room: Room, host_token: str, media_payload: Dict[str, Any]
-    ) -> Room:
+    def _require_host(self, room: Room, host_token: str) -> None:
         if host_token != room.host_token:
             raise HallError("invalid host token", protocol.ERR_FORBIDDEN, 403)
         if room.ended:
             raise HallError("room has ended", protocol.ERR_ROOM_ENDED, 410)
+
+    def _ensure_playlist_capacity(self, room: Room) -> None:
+        if len(room.playlist_order) >= MAX_PLAYLIST_ITEMS:
+            raise HallError(
+                f"at most {MAX_PLAYLIST_ITEMS} items per playlist",
+                "TOO_MANY_MEDIA",
+                409,
+            )
+
+    async def _upstream_for(self, media: MediaInfo) -> Optional[UpstreamSource]:
+        if media.kind != "url" or not media.url:
+            return None
+        if self._session is None:
+            raise HallError("hall is not started", "HALL_UNAVAILABLE", 503)
+        return UpstreamSource(
+            self._session,
+            media.url,
+            media.size,
+            media.mime,
+            media.range_supported,
+        )
+
+    async def change_media(
+        self, room: Room, host_token: str, media_payload: Dict[str, Any]
+    ) -> Room:
+        """Swap the playing file; it becomes the newest playlist entry."""
+        self._require_host(room, host_token)
+        self._ensure_playlist_capacity(room)
         media, upstream = await self._build_media(media_payload)
+        room.add_playlist_item(media)
         room.replace_media(media, upstream)
         await self.broadcast_room(room)
         logger.info(
-            "Room media changed room=%s media=%s size=%d kind=%s",
+            "Room media changed room=%s media=%s size=%d kind=%s playlist=%d",
             room.room_id,
             room.media.name,
             room.media.size,
             room.media.kind,
+            len(room.playlist_order),
+        )
+        return room
+
+    async def add_playlist_media(
+        self, room: Room, host_token: str, media_payload: Dict[str, Any]
+    ) -> Tuple[MediaInfo, bool]:
+        """Append an item; an empty room starts playing the first one."""
+        self._require_host(room, host_token)
+        self._ensure_playlist_capacity(room)
+        media, upstream = await self._build_media(media_payload)
+        room.add_playlist_item(media)
+        activated = room.media is None
+        if activated:
+            room.replace_media(media, upstream)
+        await self.broadcast_room(room)
+        logger.info(
+            "Playlist item added room=%s media=%s size=%d kind=%s active=%s",
+            room.room_id,
+            media.name,
+            media.size,
+            media.kind,
+            activated,
+        )
+        return media, activated
+
+    async def select_playlist_media(self, room: Room, host_token: str, media_id: str) -> Room:
+        self._require_host(room, host_token)
+        media = room.playlist.get(media_id)
+        if media is None:
+            raise HallError("media not found", protocol.ERR_MEDIA_NOT_FOUND, 404)
+        upstream = await self._upstream_for(media)
+        room.replace_media(media, upstream)
+        await self.broadcast_room(room)
+        logger.info(
+            "Playlist item selected room=%s media=%s", room.room_id, media.media_id
+        )
+        return room
+
+    async def remove_playlist_media(self, room: Room, host_token: str, media_id: str) -> Room:
+        self._require_host(room, host_token)
+        was_active = room.media is not None and room.media.media_id == media_id
+        following = room.following_item_id(media_id) if was_active else None
+        if not room.remove_playlist_item(media_id):
+            raise HallError("media not found", protocol.ERR_MEDIA_NOT_FOUND, 404)
+        if was_active:
+            next_media = room.playlist.get(following) if following else None
+            if next_media is not None:
+                upstream = await self._upstream_for(next_media)
+                room.replace_media(next_media, upstream)
+            else:
+                room.clear_media()
+        await self.broadcast_room(room)
+        logger.info(
+            "Playlist item removed room=%s media=%s remaining=%d",
+            room.room_id,
+            media_id,
+            len(room.playlist_order),
         )
         return room
 

@@ -66,7 +66,7 @@ class Room:
         self,
         hall: Any,
         name: str,
-        media: MediaInfo,
+        media: Optional[MediaInfo],
         block_size: int,
         cache_bytes: int,
         host_read_concurrency: int,
@@ -76,7 +76,13 @@ class Room:
         self.room_id = "r_" + secrets.token_hex(8)
         self.room_code = hall.auth.new_room_code()
         self.name = name
+        # A room may be created before the host picks anything to play.
         self.media = media
+        self.playlist: Dict[str, MediaInfo] = {}
+        self.playlist_order: List[str] = []
+        if media is not None:
+            self.playlist[media.media_id] = media
+            self.playlist_order.append(media.media_id)
         self.host_token = HallAuth.new_token()
         self.created_at = time.time()
         self.last_active = self.created_at
@@ -121,6 +127,53 @@ class Room:
         self.timeline = HostTimeline()
         self.touch()
 
+    def clear_media(self) -> None:
+        """Drop the current media, e.g. when the last playlist entry is removed."""
+        block_size = self.cache.block_size
+        cache_bytes = self.cache.max_bytes
+        self.media = None
+        self.upstream = None
+        self.cache = BlockCache(block_size, cache_bytes)
+        self.new_generation()
+        self.timeline = HostTimeline()
+        self.touch()
+
+    # -- playlist ------------------------------------------------------
+    def add_playlist_item(self, media: MediaInfo) -> None:
+        self.playlist[media.media_id] = media
+        self.playlist_order.append(media.media_id)
+        self.touch()
+
+    def remove_playlist_item(self, media_id: str) -> bool:
+        if media_id not in self.playlist:
+            return False
+        self.playlist.pop(media_id, None)
+        self.playlist_order = [item for item in self.playlist_order if item != media_id]
+        return True
+
+    def following_item_id(self, media_id: str) -> Optional[str]:
+        """Next entry after ``media_id``, falling back to the one before it."""
+        if media_id not in self.playlist_order:
+            return None
+        index = self.playlist_order.index(media_id)
+        if index + 1 < len(self.playlist_order):
+            return self.playlist_order[index + 1]
+        if index > 0:
+            return self.playlist_order[index - 1]
+        return None
+
+    def playlist_public(self) -> List[Dict[str, Any]]:
+        active_id = self.media.media_id if self.media else None
+        items = []
+        for media_id in self.playlist_order:
+            media = self.playlist.get(media_id)
+            if media is None:
+                continue
+            item = media.public()
+            item["active"] = media_id == active_id
+            items.append(item)
+        return items
+
     # -- members -------------------------------------------------------
     def add_member(self, name: str) -> Member:
         member_id = "m_" + secrets.token_hex(8)
@@ -163,12 +216,14 @@ class Room:
 
     # -- blocks --------------------------------------------------------
     async def load_block(self, index: int) -> bytes:
+        if self.ended:
+            raise SourceOffline("room has ended")
+        if self.media is None:
+            raise SourceOffline("no media selected")
         offset = index * self.host_source.block_size
         length = min(self.host_source.block_size, self.media.size - offset)
         if length <= 0:
             return b""
-        if self.ended:
-            raise SourceOffline("room has ended")
         if self.media.kind == "url":
             if self.upstream is None:
                 raise SourceOffline("upstream is not configured")
@@ -198,6 +253,11 @@ class Room:
         snapshot["online"] = self.host_online
         return snapshot
 
+    def media_url(self) -> Optional[str]:
+        if self.media is None:
+            return None
+        return self.hall.auth.media_url(self.room_id, self.media.media_id)
+
     def room_state(self) -> Dict[str, Any]:
         return {
             "type": "room_state",
@@ -205,8 +265,9 @@ class Room:
             "room_code": self.room_code,
             "name": self.name,
             "server_ts": round(_wall_ms(), 3),
-            "media": self.media.public(),
-            "media_url": self.hall.auth.media_url(self.room_id, self.media.media_id),
+            "media": self.media.public() if self.media else None,
+            "media_url": self.media_url(),
+            "playlist": self.playlist_public(),
             "host": self.host_snapshot(),
             "members": [m.public() for m in self.members.values()],
             "subtitles": self.subtitle_list(),
@@ -220,8 +281,9 @@ class Room:
         return {
             "room_code": self.room_code,
             "name": self.name,
-            "media_name": self.media.name,
-            "media_size": self.media.size,
+            "media_name": self.media.name if self.media else None,
+            "media_size": self.media.size if self.media else 0,
+            "playlist_count": len(self.playlist_order),
             "member_count": self.member_count(),
             "host_online": self.host_online,
             "created_at": round(self.created_at, 3),
@@ -233,7 +295,9 @@ class Room:
             "room_code": self.room_code,
             "name": self.name,
             "ended": self.ended,
-            "media": self.media.public(),
+            "media": self.media.public() if self.media else None,
+            "media_url": self.media_url(),
+            "playlist": self.playlist_public(),
             "host": self.host_snapshot(),
             "member_count": self.member_count(),
             "members": [m.public() for m in self.members.values()],
@@ -248,4 +312,4 @@ class Room:
         }
 
     def media_list(self) -> List[Dict[str, Any]]:
-        return [self.media.public()]
+        return self.playlist_public()
