@@ -91,6 +91,33 @@ async def create_room(payload: CreateRoomRequest, request: Request):
     }
 
 
+@router.post("/api/rooms/{room_ref}/media")
+async def change_media(
+    room_ref: str,
+    payload: MediaPayload,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        await hall.change_media(
+            room, x_host_token or "", payload.model_dump(exclude_none=True)
+        )
+    except HallError as exc:
+        return _hall_error(exc)
+    return {
+        "media_id": room.media.media_id,
+        "media": room.media.public(),
+        "media_url": hall.auth.media_url(room.room_id, room.media.media_id),
+        "room": room.public_info(),
+    }
+
+
 @router.post("/api/rooms/{room_ref}/join")
 async def join_room(room_ref: str, payload: JoinRequest, request: Request):
     hall = _hall(request)

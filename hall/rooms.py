@@ -108,6 +108,19 @@ class Room:
     def has_audience(self) -> bool:
         return self.host_online or any(m.connected for m in self.members.values())
 
+    def replace_media(self, media: MediaInfo, upstream: Optional[UpstreamSource] = None) -> None:
+        """Swap the room's media, dropping every block or read tied to the old file."""
+        block_size = self.cache.block_size
+        cache_bytes = self.cache.max_bytes
+        self.media = media
+        self.upstream = upstream
+        self.cache = BlockCache(block_size, cache_bytes)
+        # In-flight host reads belong to the old media; failing them also makes
+        # any response still streaming from the old file stop quietly.
+        self.new_generation()
+        self.timeline = HostTimeline()
+        self.touch()
+
     # -- members -------------------------------------------------------
     def add_member(self, name: str) -> Member:
         member_id = "m_" + secrets.token_hex(8)
@@ -193,6 +206,7 @@ class Room:
             "name": self.name,
             "server_ts": round(_wall_ms(), 3),
             "media": self.media.public(),
+            "media_url": self.hall.auth.media_url(self.room_id, self.media.media_id),
             "host": self.host_snapshot(),
             "members": [m.public() for m in self.members.values()],
             "subtitles": self.subtitle_list(),

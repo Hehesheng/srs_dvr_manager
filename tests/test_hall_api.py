@@ -131,3 +131,71 @@ def test_room_list_shows_active_rooms(monkeypatch):
         )
         remaining = client.get("/hall/api/rooms").json()["rooms"]
         assert [room["room_code"] for room in remaining] == [second["room_code"]]
+
+
+def test_host_can_change_media(monkeypatch):
+    with _client(monkeypatch) as client:
+        room = _create_room(client)
+        member = client.post(
+            f"/hall/api/rooms/{room['room_code']}/join", json={"name": "alice"}
+        ).json()
+        old_media_id = room["media_id"]
+        old_media_url = room["media_url"]
+
+        new_payload = {
+            "kind": "host_file",
+            "name": "second.mp4",
+            "size": 2_000_000,
+            "mime": "video/mp4",
+        }
+        denied = client.post(
+            f"/hall/api/rooms/{room['room_code']}/media",
+            json=new_payload,
+            headers={"X-Host-Token": member["member_token"]},
+        )
+        assert denied.status_code == 403
+
+        with client.websocket_connect(f"/hall/ws/{room['room_id']}") as ws:
+            ws.send_json(
+                {"type": "auth", "role": "member", "token": member["member_token"]}
+            )
+            assert ws.receive_json()["type"] == "auth_ok"
+
+            changed = client.post(
+                f"/hall/api/rooms/{room['room_code']}/media",
+                json=new_payload,
+                headers={"X-Host-Token": room["host_token"]},
+            )
+            assert changed.status_code == 200, changed.text
+            data = changed.json()
+            assert data["media"]["name"] == "second.mp4"
+            assert data["media_id"] != old_media_id
+            assert "/hall/media/" in data["media_url"]
+
+            followed = None
+            for _ in range(10):
+                message = ws.receive_json()
+                if (
+                    message.get("type") == "room_state"
+                    and message.get("media", {}).get("media_id") == data["media_id"]
+                ):
+                    followed = message
+                    break
+            assert followed is not None
+            assert followed["media_url"].startswith("/hall/media/")
+            assert followed["media"]["name"] == "second.mp4"
+
+        info = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        assert info["media"]["name"] == "second.mp4"
+        assert client.get(old_media_url, headers={"Range": "bytes=0-1"}).status_code == 404
+
+        client.delete(
+            f"/hall/api/rooms/{room['room_code']}",
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        ended = client.post(
+            f"/hall/api/rooms/{room['room_code']}/media",
+            json=new_payload,
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert ended.status_code == 410

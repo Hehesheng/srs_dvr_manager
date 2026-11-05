@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import yaml
@@ -198,6 +198,34 @@ class HallManager:
             raise HallError("too many rooms", "TOO_MANY_ROOMS", 429)
 
         room_name = (name or "Media Room").strip()[:64] or "Media Room"
+        media, upstream = await self._build_media(media_payload)
+
+        room = Room(
+            hall=self,
+            name=room_name,
+            media=media,
+            block_size=self.config.block_size,
+            cache_bytes=self.config.cache_bytes_per_room,
+            host_read_concurrency=self.config.host_read_concurrency,
+            upstream=upstream,
+        )
+        while room.room_code in self._codes:
+            room.room_code = self.auth.new_room_code()
+        self.rooms[room.room_id] = room
+        self._codes[room.room_code] = room.room_id
+        logger.info(
+            "Room created id=%s code=%s media=%s size=%d kind=%s",
+            room.room_id,
+            room.room_code,
+            room.media.name,
+            room.media.size,
+            room.media.kind,
+        )
+        return room
+
+    async def _build_media(
+        self, media_payload: Dict[str, Any]
+    ) -> Tuple[MediaInfo, Optional[UpstreamSource]]:
         kind = str(media_payload.get("kind") or "host_file")
         media_name = str(media_payload.get("name") or "").strip()[:256]
         if kind not in ("host_file", "url"):
@@ -251,24 +279,21 @@ class HallManager:
                 media.mime,
                 media.range_supported,
             )
+        return media, upstream
 
-        room = Room(
-            hall=self,
-            name=room_name,
-            media=media,
-            block_size=self.config.block_size,
-            cache_bytes=self.config.cache_bytes_per_room,
-            host_read_concurrency=self.config.host_read_concurrency,
-            upstream=upstream,
-        )
-        while room.room_code in self._codes:
-            room.room_code = self.auth.new_room_code()
-        self.rooms[room.room_id] = room
-        self._codes[room.room_code] = room.room_id
+    async def change_media(
+        self, room: Room, host_token: str, media_payload: Dict[str, Any]
+    ) -> Room:
+        if host_token != room.host_token:
+            raise HallError("invalid host token", protocol.ERR_FORBIDDEN, 403)
+        if room.ended:
+            raise HallError("room has ended", protocol.ERR_ROOM_ENDED, 410)
+        media, upstream = await self._build_media(media_payload)
+        room.replace_media(media, upstream)
+        await self.broadcast_room(room)
         logger.info(
-            "Room created id=%s code=%s media=%s size=%d kind=%s",
+            "Room media changed room=%s media=%s size=%d kind=%s",
             room.room_id,
-            room.room_code,
             room.media.name,
             room.media.size,
             room.media.kind,
