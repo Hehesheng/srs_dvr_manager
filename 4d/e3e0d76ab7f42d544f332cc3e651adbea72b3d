@@ -1,0 +1,77 @@
+hall/manager.py
+  s_856b7f4314a1d9::t_1e4e5740d3236a 253,258
+  s_856b7f4314a1d9::t_6a70dffae5c221 1-252,254-257,259-392
+requirements-dev.txt
+  s_856b7f4314a1d9::t_1c804cd61f93d2 1-3
+hall/rooms.py
+  s_856b7f4314a1d9::t_63bd537c78e44f 1-203
+.gitignore
+  s_856b7f4314a1d9::t_a30e70e0a94fa8 8
+hall/router.py
+  s_856b7f4314a1d9::t_a983c8b9ba8dba 1-49,58-244
+  s_856b7f4314a1d9::t_678b3030529ad5 50-57
+tests/test_hall_timeline.py
+  s_856b7f4314a1d9::t_944c0097670416 1-97,99-100,103
+  s_856b7f4314a1d9::t_13437b93dee428 98,101-102,104
+tests/test_hall_api.py
+  s_856b7f4314a1d9::t_4f33a443497ef1 1-111
+hall/host_source.py
+  s_856b7f4314a1d9::t_4101ac43e07dd5 1-53,55-173,175-285
+  s_856b7f4314a1d9::t_2e29559f04ff35 54
+  s_856b7f4314a1d9::t_c0ea23acfa0328 174
+hall/media.py
+  s_856b7f4314a1d9::t_dc90dbf8246faa 1-138
+tests/test_hall_range.py
+  s_856b7f4314a1d9::t_3ae3f26137ad8f 1-50
+api.py
+  s_856b7f4314a1d9::t_a1df2388fe9ff6 65
+  s_856b7f4314a1d9::t_217ea6904eb126 13-14
+  s_856b7f4314a1d9::t_13feccee0da57f 35-44,48-50
+hall/upstream.py
+  s_856b7f4314a1d9::t_097abf0eea0afe 1-222
+tests/test_hall_cache.py
+  s_856b7f4314a1d9::t_e166921e2b77c6 1-62
+hall/timeline.py
+  s_856b7f4314a1d9::t_5541f153e6990b 58-60,63
+  s_856b7f4314a1d9::t_90d9b4e6dd5329 1-57,61-62,64-152
+hall/protocol.py
+  s_856b7f4314a1d9::t_ea9e37733e0334 1-85
+tests/test_hall_auth.py
+  s_856b7f4314a1d9::t_a4d328cb401011 1-36
+pytest.ini
+  s_856b7f4314a1d9::t_ab6d5dfd4c5b8a 1-3
+hall/cache.py
+  s_856b7f4314a1d9::t_544c54af65cda1 1-96
+tests/test_hall_host_source.py
+  s_856b7f4314a1d9::t_0f07fe1ccadc41 1-27,29-44,46-59,61-74,76-83
+  s_856b7f4314a1d9::t_1ca8428752b990 28,45,60,75
+hall/ws.py
+  s_856b7f4314a1d9::t_759bafdc50bffc 185-188
+  s_856b7f4314a1d9::t_10ccfe117274be 30
+  s_856b7f4314a1d9::t_3b0ad6fd26f4ef 1-27,29,31-134,136-179,189-218,220-250
+  s_856b7f4314a1d9::t_bd193e0c61c7cf 28,135,219
+  s_856b7f4314a1d9::t_16faad55114b0b 180-184
+hall/auth.py
+  s_856b7f4314a1d9::t_04b7a3ba8eda11 1-79
+hall/__init__.py
+  s_856b7f4314a1d9::t_3a424ad28162b4 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "4de3e0d76ab7f42d544f332cc3e651adbea72b3d",
+  "prompts": {},
+  "logical_commit_id": "4de3e0d76ab7f42d544f332cc3e651adbea72b3d",
+  "sessions": {
+    "s_856b7f4314a1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d0d1cf1-5130-42fb-b5ed-d7fea40259ed",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "huanghuisheng <huanghuisheng@bigo.sg>",
+      "total_additions": 2643,
+      "total_deletions": 32
+    }
+  }
+}
