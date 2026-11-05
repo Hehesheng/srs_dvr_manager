@@ -35,6 +35,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "host_read_concurrency": 4,
     "room_idle_timeout": 1800,
     "member_idle_timeout": 600,
+    "host_offline_timeout": 30,
     "media_url_ttl": 86400,
     "max_media_bytes": 64 * 1024 * 1024 * 1024,
     "max_subtitle_bytes": 10 * 1024 * 1024,
@@ -72,6 +73,9 @@ class HallConfig:
     host_read_concurrency: int = 4
     room_idle_timeout: float = 1800
     member_idle_timeout: float = 600
+    # The host cannot come back once its page is gone, so a room whose host
+    # stays offline is ended after this grace period.
+    host_offline_timeout: float = 30.0
     media_url_ttl: int = 86400
     max_media_bytes: int = 64 * 1024 * 1024 * 1024
     max_subtitle_bytes: int = 10 * 1024 * 1024
@@ -99,6 +103,7 @@ class HallConfig:
             host_read_concurrency=max(1, int(merged["host_read_concurrency"])),
             room_idle_timeout=max(60.0, float(merged["room_idle_timeout"])),
             member_idle_timeout=max(60.0, float(merged["member_idle_timeout"])),
+            host_offline_timeout=max(1.0, float(merged["host_offline_timeout"])),
             media_url_ttl=max(60, int(merged["media_url_ttl"])),
             max_media_bytes=max(1024 * 1024, int(merged["max_media_bytes"])),
             max_subtitle_bytes=max(1024, int(merged["max_subtitle_bytes"])),
@@ -116,6 +121,7 @@ class HallManager:
         self.rooms: Dict[str, Room] = {}
         self._codes: Dict[str, str] = {}
         self._ended_at: Dict[str, float] = {}
+        self._host_offline_tasks: Dict[str, asyncio.Task] = {}
         self._session: Optional[aiohttp.ClientSession] = None
         self._cleanup_task: Optional[asyncio.Task] = None
         self._pulse_task: Optional[asyncio.Task] = None
@@ -157,6 +163,9 @@ class HallManager:
                     pass
         self._cleanup_task = None
         self._pulse_task = None
+        for task in list(self._host_offline_tasks.values()):
+            task.cancel()
+        self._host_offline_tasks.clear()
         for room in list(self.rooms.values()):
             await self._close_room(room, code=1001, reason="server shutting down")
         self.rooms.clear()
@@ -478,6 +487,10 @@ class HallManager:
     async def end_room(self, room: Room, host_token: str) -> None:
         if host_token != room.host_token:
             raise HallError("invalid host token", protocol.ERR_FORBIDDEN, 403)
+        await self._end_room(room, code=4000, reason="room ended")
+
+    async def _end_room(self, room: Room, code: int = 4000, reason: str = "room ended") -> None:
+        self._cancel_host_offline_timer(room)
         if room.ended:
             return
         room.ended = True
@@ -486,8 +499,49 @@ class HallManager:
         room.clear_subtitles()
         self._ended_at[room.room_id] = time.time()
         await self.broadcast_room(room)
-        await self._close_room(room, code=4000, reason="room ended")
+        await self._close_room(room, code=code, reason=reason)
         logger.info("Room ended id=%s", room.room_id)
+
+    # -- host presence -------------------------------------------------
+    def host_connected(self, room: Room) -> None:
+        """Cancel a pending offline end when the host comes back."""
+        self._cancel_host_offline_timer(room)
+
+    def host_disconnected(self, room: Room) -> None:
+        """End the room when its host does not come back in time.
+
+        A closed host page drops the only copy of the media, so there is
+        nothing left to serve; a short grace period still lets a reload or a
+        network blip reconnect.
+        """
+        if room.ended or room.host_online:
+            return
+        self._cancel_host_offline_timer(room)
+        self._host_offline_tasks[room.room_id] = asyncio.create_task(
+            self._end_after_host_offline(room)
+        )
+
+    def _cancel_host_offline_timer(self, room: Room) -> None:
+        task = self._host_offline_tasks.pop(room.room_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _end_after_host_offline(self, room: Room) -> None:
+        try:
+            await asyncio.sleep(self.config.host_offline_timeout)
+        except asyncio.CancelledError:
+            raise
+        self._host_offline_tasks.pop(room.room_id, None)
+        if room.ended or room.host_online:
+            return
+        if self.rooms.get(room.room_id) is not room:
+            return
+        logger.info(
+            "Host stayed offline for %.0fs; ending room id=%s",
+            self.config.host_offline_timeout,
+            room.room_id,
+        )
+        await self._end_room(room, code=4000, reason="host offline")
 
     # -- broadcasting --------------------------------------------------
     def _connections(self, room: Room) -> List[Any]:
@@ -568,6 +622,7 @@ class HallManager:
             member.ws = None
 
     def _remove_room(self, room: Room) -> None:
+        self._cancel_host_offline_timer(room)
         self.rooms.pop(room.room_id, None)
         if self._codes.get(room.room_code) == room.room_id:
             self._codes.pop(room.room_code, None)

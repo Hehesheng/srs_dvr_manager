@@ -112,6 +112,8 @@ async def handle_websocket(ws: WebSocket, room_ref: str, hall: HallManager) -> N
     role = await _authenticate(ws, room, payload)
     if role is None:
         return
+    if role == "host":
+        hall.host_connected(room)
 
     member: Optional[Member] = None
     if role == "member":
@@ -175,6 +177,7 @@ async def handle_websocket(ws: WebSocket, room_ref: str, hall: HallManager) -> N
     finally:
         if role == "host":
             room.clear_host(ws)
+            hall.host_disconnected(room)
             logger.info("Hall host disconnected room=%s", room.room_id)
         elif member is not None:
             if member.ws is ws:
