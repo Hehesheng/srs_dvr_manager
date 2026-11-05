@@ -1,0 +1,31 @@
+hall/timeline.py
+  s_856b7f4314a1d9::t_38490b9edeb305 95-101,105
+  s_856b7f4314a1d9::t_12a755b8cc8f18 53
+  s_856b7f4314a1d9::t_1ebea6eebf9779 149-150,153,161
+  s_856b7f4314a1d9::t_f9e7b495af4546 173
+  s_856b7f4314a1d9::t_7c0cf5af1582c4 27-28,30
+  s_856b7f4314a1d9::t_7f65dd194ad373 41
+tests/test_hall_timeline.py
+  s_856b7f4314a1d9::t_c2da34c0490019 25,32
+  s_856b7f4314a1d9::t_3bc0d232491dfe 119-143
+  s_856b7f4314a1d9::t_06429d35d8f5a1 117-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "9027fc3f475b8f3ecc45fb131f12cf43e2429f3c",
+  "prompts": {},
+  "logical_commit_id": "9027fc3f475b8f3ecc45fb131f12cf43e2429f3c",
+  "sessions": {
+    "s_856b7f4314a1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d0d1cf1-5130-42fb-b5ed-d7fea40259ed",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "huanghuisheng <huanghuisheng@bigo.sg>",
+      "total_additions": 298,
+      "total_deletions": 59
+    }
+  }
+}
