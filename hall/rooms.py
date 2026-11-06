@@ -28,12 +28,18 @@ def _wall_ms() -> float:
 @dataclass
 class MediaInfo:
     media_id: str
-    kind: str  # host_file | url
+    kind: str  # host_file | url | jellyfin
     name: str
     size: int
     mime: str
     url: Optional[str] = None
     range_supported: bool = True
+    # "direct" plays the bytes as they are; "hls" streams a Jellyfin transcode.
+    playback_mode: str = "direct"
+    # The item's real length.  For "hls" this is the only trustworthy duration,
+    # because the transcoded playlist grows as it is encoded.
+    duration: float = 0.0
+    item_id: Optional[str] = None
 
     def public(self) -> Dict[str, Any]:
         return {
@@ -43,6 +49,9 @@ class MediaInfo:
             "size": self.size,
             "mime": self.mime,
             "range_supported": self.range_supported,
+            "playback_mode": self.playback_mode,
+            "duration": round(self.duration, 3),
+            "item_id": self.item_id,
         }
 
 
@@ -79,6 +88,8 @@ class Room:
         cache_bytes: int,
         host_read_concurrency: int,
         upstream: Optional[UpstreamSource] = None,
+        jellyfin_source: Optional[Any] = None,
+        hls: Optional[Any] = None,
     ) -> None:
         self.hall = hall
         self.room_id = "r_" + secrets.token_hex(8)
@@ -113,6 +124,13 @@ class Room:
             concurrency=host_read_concurrency,
         )
         self.upstream = upstream
+        # Jellyfin state.  The token lives here and nowhere a client can read.
+        self.jellyfin: Optional[Any] = None
+        self.jellyfin_source: Optional[Any] = jellyfin_source
+        self.hls: Optional[Any] = hls
+        self.jellyfin_media_source: Optional[Dict[str, Any]] = None
+        # Latest seek the host asked for while a restart was already running.
+        self.pending_seek: float = 0.0
         self.members: Dict[str, Member] = {}
         self.member_tokens: Dict[str, str] = {}
         self.subtitles: Dict[str, Subtitle] = {}
@@ -126,12 +144,20 @@ class Room:
     def has_audience(self) -> bool:
         return self.host_online or any(m.connected for m in self.members.values())
 
-    def replace_media(self, media: MediaInfo, upstream: Optional[UpstreamSource] = None) -> None:
+    def replace_media(
+        self,
+        media: MediaInfo,
+        upstream: Optional[UpstreamSource] = None,
+        jellyfin_source: Optional[Any] = None,
+        hls: Optional[Any] = None,
+    ) -> None:
         """Swap the room's media, dropping every block or read tied to the old file."""
         block_size = self.cache.block_size
         cache_bytes = self.cache.max_bytes
         self.media = media
         self.upstream = upstream
+        self.jellyfin_source = jellyfin_source
+        self.hls = hls
         self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         # In-flight host reads belong to the old media; failing them also makes
@@ -148,6 +174,8 @@ class Room:
         cache_bytes = self.cache.max_bytes
         self.media = None
         self.upstream = None
+        self.jellyfin_source = None
+        self.hls = None
         self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         self.new_generation()
@@ -281,6 +309,12 @@ class Room:
             if self.upstream is None:
                 raise SourceOffline("upstream is not configured")
             return await self.upstream.read(offset, length)
+        if self.media.kind == "jellyfin":
+            # A transcoded item has no byte range to serve: it is streamed as
+            # HLS through the playlist endpoints instead.
+            if self.jellyfin_source is None:
+                raise SourceOffline("jellyfin source is not configured")
+            return await self.jellyfin_source.read(offset, length)
         # After a playlist switch the host needs a moment to hand the new file
         # to its worker; reading before that returns the previous file's bytes.
         if not await self.wait_host_media():
@@ -348,9 +382,23 @@ class Room:
         snapshot["online"] = self.host_online
         return snapshot
 
+    @property
+    def media_epoch(self) -> int:
+        """Bumped every time the transcoder is restarted for a seek."""
+        return int(self.hls.epoch) if self.hls is not None else 0
+
+    @property
+    def media_start(self) -> float:
+        """Where in the item the current transcode begins, in seconds."""
+        return float(self.hls.start_seconds) if self.hls is not None else 0.0
+
     def media_url(self) -> Optional[str]:
         if self.media is None:
             return None
+        if self.media.playback_mode == "hls":
+            return self.hall.auth.hls_playlist_url(
+                self.room_id, self.media.media_id, self.media_epoch
+            )
         return self.hall.auth.media_url(self.room_id, self.media.media_id)
 
     def room_state(self) -> Dict[str, Any]:
@@ -362,12 +410,15 @@ class Room:
             "server_ts": round(_wall_ms(), 3),
             "media": self.media.public() if self.media else None,
             "media_url": self.media_url(),
+            "media_epoch": self.media_epoch,
+            "media_start": round(self.media_start, 3),
             "playlist": self.playlist_public(),
             "host": self.host_snapshot(),
             "members": [m.public() for m in self.members.values()],
             "subtitles": self.subtitle_list(),
             "active_subtitle_id": self.active_subtitle_id,
             "active_subtitle_visible": self.active_subtitle_visible,
+            "jellyfin": self.jellyfin.public() if self.jellyfin else None,
             "ended": self.ended,
         }
 
@@ -392,6 +443,8 @@ class Room:
             "ended": self.ended,
             "media": self.media.public() if self.media else None,
             "media_url": self.media_url(),
+            "media_epoch": self.media_epoch,
+            "media_start": round(self.media_start, 3),
             "playlist": self.playlist_public(),
             "host": self.host_snapshot(),
             "member_count": self.member_count(),
@@ -399,6 +452,7 @@ class Room:
             "subtitles": self.subtitle_list(),
             "active_subtitle_id": self.active_subtitle_id,
             "active_subtitle_visible": self.active_subtitle_visible,
+            "jellyfin": self.jellyfin.public() if self.jellyfin else None,
             "cache": {
                 "bytes": self.cache.bytes_used,
                 "hits": self.cache.hits,

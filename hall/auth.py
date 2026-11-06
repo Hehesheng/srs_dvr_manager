@@ -78,6 +78,38 @@ class HallAuth:
         expected = self._sign(room_id, media_id, exp)
         return hmac.compare_digest(expected, sig or "")
 
+    # Transcoded playback uses its own signing context.  The epoch is part of
+    # the message so a playlist handed out before a seek cannot be replayed
+    # against the stream that replaced it.
+    def hls_signature(self, room_id: str, media_id: str, epoch: int, exp: int) -> str:
+        message = f"hls:{room_id}:{media_id}:{int(epoch)}:{exp}".encode("utf-8")
+        return hmac.new(self._secret, message, hashlib.sha256).hexdigest()
+
+    def _hls_exp(self, exp: Optional[int]) -> int:
+        return int(time.time()) + self.media_url_ttl if exp is None else int(exp)
+
+    def hls_query(self, room_id: str, media_id: str, epoch: int, exp: Optional[int] = None) -> str:
+        exp = self._hls_exp(exp)
+        sig = self.hls_signature(room_id, media_id, epoch, exp)
+        return f"epoch={int(epoch)}&exp={exp}&sig={sig}"
+
+    def hls_playlist_url(
+        self, room_id: str, media_id: str, epoch: int, exp: Optional[int] = None
+    ) -> str:
+        return f"/hall/media/{room_id}/{media_id}/live.m3u8?{self.hls_query(room_id, media_id, epoch, exp)}"
+
+    def hls_segment_url(
+        self, room_id: str, media_id: str, epoch: int, index: int, exp: Optional[int] = None
+    ) -> str:
+        query = self.hls_query(room_id, media_id, epoch, exp)
+        return f"/hall/media/{room_id}/{media_id}/seg/{int(index)}.ts?{query}"
+
+    def verify_hls(self, room_id: str, media_id: str, epoch: int, exp: int, sig: str) -> bool:
+        if exp < int(time.time()):
+            return False
+        expected = self.hls_signature(room_id, media_id, epoch, exp)
+        return hmac.compare_digest(expected, sig or "")
+
     # Subtitles use a separate signing context so a media URL signature can
     # never be replayed against the subtitle endpoint (or vice versa).
     def subtitle_signature(self, room_id: str, subtitle_id: str, exp: int) -> str:

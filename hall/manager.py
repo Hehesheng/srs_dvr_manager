@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -12,6 +12,20 @@ import yaml
 
 from . import protocol
 from .auth import HallAuth
+from .cache import BlockCache
+from .jellyfin import (
+    HlsSession,
+    JellyfinAuthError,
+    JellyfinClient,
+    JellyfinError,
+    JellyfinSession,
+    JellyfinSource,
+    direct_mime,
+    duration_seconds,
+    item_name,
+    playback_mode,
+    text_subtitle_streams,
+)
 from .rooms import MediaInfo, Member, Room
 from .subtitles import (
     Subtitle,
@@ -64,6 +78,60 @@ class HallError(Exception):
             self.status_code = status_code
 
 
+JELLYFIN_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "url": "",
+    "max_bitrate": 8_000_000,
+    "seek_debounce_ms": 800,
+}
+
+
+@dataclass
+class BuiltMedia:
+    """A media item plus whatever source object it needs to be served."""
+
+    media: MediaInfo
+    upstream: Optional[UpstreamSource] = None
+    jellyfin_source: Optional[JellyfinSource] = None
+    hls: Optional[HlsSession] = None
+
+
+@dataclass
+class JellyfinConfig:
+    """Where the Jellyfin server lives, and how hard we are allowed to pull."""
+
+    enabled: bool = False
+    url: str = ""
+    max_bitrate: int = 8_000_000
+    seek_debounce_ms: int = 800
+
+    @classmethod
+    def from_payload(cls, payload: Optional[Dict[str, Any]]) -> "JellyfinConfig":
+        merged = dict(JELLYFIN_DEFAULTS)
+        if isinstance(payload, dict):
+            merged.update({k: v for k, v in payload.items() if v is not None})
+        url = str(merged.get("url") or "").strip().rstrip("/")
+        enabled = bool(merged.get("enabled")) and url.startswith(("http://", "https://"))
+        try:
+            bitrate = int(merged.get("max_bitrate"))
+        except (TypeError, ValueError):
+            bitrate = JELLYFIN_DEFAULTS["max_bitrate"]
+        try:
+            debounce = int(merged.get("seek_debounce_ms"))
+        except (TypeError, ValueError):
+            debounce = JELLYFIN_DEFAULTS["seek_debounce_ms"]
+        return cls(
+            enabled=enabled,
+            url=url,
+            max_bitrate=max(500_000, min(40_000_000, bitrate)),
+            seek_debounce_ms=max(0, min(5000, debounce)),
+        )
+
+    def public(self) -> Dict[str, Any]:
+        """What the frontend may know: no credentials live here."""
+        return {"enabled": self.enabled, "max_bitrate": self.max_bitrate}
+
+
 @dataclass
 class HallConfig:
     enabled: bool = True
@@ -82,15 +150,18 @@ class HallConfig:
     max_media_bytes: int = 64 * 1024 * 1024 * 1024
     max_subtitle_bytes: int = 10 * 1024 * 1024
     signing_secret: str = ""
+    jellyfin: JellyfinConfig = field(default_factory=JellyfinConfig)
 
     @classmethod
     def load(cls, config_path: str = "config.yaml") -> "HallConfig":
         raw: Dict[str, Any] = {}
+        jellyfin_raw: Optional[Dict[str, Any]] = None
         if os.path.exists(config_path):
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
                     payload = yaml.safe_load(f) or {}
                 raw = payload.get("hall", {}) or {}
+                jellyfin_raw = payload.get("jellyfin")
             except Exception:
                 logger.exception("Failed to read hall config; using defaults")
         merged = dict(DEFAULT_CONFIG)
@@ -110,6 +181,7 @@ class HallConfig:
             max_media_bytes=max(1024 * 1024, int(merged["max_media_bytes"])),
             max_subtitle_bytes=max(1024, int(merged["max_subtitle_bytes"])),
             signing_secret=str(merged.get("signing_secret") or ""),
+            jellyfin=JellyfinConfig.from_payload(jellyfin_raw),
         )
 
 
@@ -128,6 +200,11 @@ class HallManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._pulse_task: Optional[asyncio.Task] = None
         self._started = False
+        self.jellyfin: Optional[JellyfinClient] = None
+        # One seek restart per room is enough; dragging must not spawn a
+        # transcoder per pointer move.
+        self._seek_tasks: Dict[str, asyncio.Task] = {}
+        self._subtitle_tasks: set = set()
 
     @classmethod
     def from_config(cls, config_path: str = "config.yaml") -> "HallManager":
@@ -144,14 +221,21 @@ class HallManager:
             timeout=aiohttp.ClientTimeout(total=25, connect=8, sock_read=20)
         )
         self._started = True
+        if self.config.jellyfin.enabled:
+            self.jellyfin = JellyfinClient(
+                self._session,
+                self.config.jellyfin.url,
+                self.config.jellyfin.max_bitrate,
+            )
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._pulse_task = asyncio.create_task(self._pulse_loop())
         logger.info(
-            "Media hall started: max_rooms=%d block=%d cache_room=%d cache_total=%d",
+            "Media hall started: max_rooms=%d block=%d cache_room=%d cache_total=%d jellyfin=%s",
             self.config.max_rooms,
             self.config.block_size,
             self.config.cache_bytes_per_room,
             self.config.cache_bytes_total,
+            "on" if self.jellyfin else "off",
         )
 
     async def stop(self) -> None:
@@ -169,6 +253,7 @@ class HallManager:
             task.cancel()
         self._host_offline_tasks.clear()
         for room in list(self.rooms.values()):
+            self._stop_room_transcode(room)
             await self._close_room(room, code=1001, reason="server shutting down")
         self.rooms.clear()
         self._codes.clear()
@@ -213,9 +298,10 @@ class HallManager:
 
         room_name = (name or "Media Room").strip()[:64] or "Media Room"
         media: Optional[MediaInfo] = None
-        upstream: Optional[UpstreamSource] = None
+        built: Optional[BuiltMedia] = None
         if media_payload:
-            media, upstream = await self._build_media(media_payload)
+            built = await self._build_media(media_payload)
+            media = built.media
 
         room = Room(
             hall=self,
@@ -224,7 +310,9 @@ class HallManager:
             block_size=self.config.block_size,
             cache_bytes=self.config.cache_bytes_per_room,
             host_read_concurrency=self.config.host_read_concurrency,
-            upstream=upstream,
+            upstream=built.upstream if built else None,
+            jellyfin_source=built.jellyfin_source if built else None,
+            hls=built.hls if built else None,
         )
         while room.room_code in self._codes:
             room.room_code = self.auth.new_room_code()
@@ -240,15 +328,18 @@ class HallManager:
         return room
 
     async def _build_media(
-        self, media_payload: Dict[str, Any]
-    ) -> Tuple[MediaInfo, Optional[UpstreamSource]]:
+        self, media_payload: Dict[str, Any], room: Optional[Room] = None
+    ) -> "BuiltMedia":
         kind = str(media_payload.get("kind") or "host_file")
         media_name = str(media_payload.get("name") or "").strip()[:256]
-        if kind not in ("host_file", "url"):
-            raise HallError("media.kind must be host_file or url")
+        if kind not in ("host_file", "url", "jellyfin"):
+            raise HallError("media.kind must be host_file, url or jellyfin")
 
         media_id = "m_" + os.urandom(8).hex()
         upstream: Optional[UpstreamSource] = None
+
+        if kind == "jellyfin":
+            return await self._build_jellyfin_media(media_payload, room, media_id)
 
         if kind == "host_file":
             try:
@@ -295,7 +386,84 @@ class HallManager:
                 media.mime,
                 media.range_supported,
             )
-        return media, upstream
+        return BuiltMedia(media=media, upstream=upstream)
+
+    async def _build_jellyfin_media(
+        self, media_payload: Dict[str, Any], room: Optional[Room], media_id: str
+    ) -> "BuiltMedia":
+        if self.jellyfin is None:
+            raise HallError(
+                "Jellyfin 源未启用", protocol.ERR_JELLYFIN_UNAVAILABLE, 503
+            )
+        if room is None or room.jellyfin is None:
+            raise HallError(
+                "请先登录 Jellyfin", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
+            )
+        item_id = str(media_payload.get("item_id") or "").strip()
+        if not item_id or not item_id.replace("-", "").isalnum():
+            raise HallError("缺少有效的 Jellyfin 视频 ID")
+
+        try:
+            item = await self.jellyfin.item(room.jellyfin, item_id)
+        except JellyfinAuthError:
+            room.jellyfin = None
+            raise HallError(
+                "Jellyfin 登录已失效，请重新登录",
+                protocol.ERR_JELLYFIN_AUTH_FAILED,
+                401,
+            )
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+
+        sources = item.get("MediaSources") or []
+        if not sources:
+            raise HallError("这个条目没有可播放的文件", "MEDIA_NOT_FOUND", 404)
+        source = sources[0]
+        mode = playback_mode(source)
+        duration = duration_seconds(item)
+        name = item_name(item)
+        room.jellyfin_item = source
+
+        if mode == "direct":
+            try:
+                size = await self.jellyfin.probe_size(room.jellyfin, item_id)
+            except JellyfinError as exc:
+                raise HallError(exc.message, exc.code, exc.status_code)
+            if size <= 0 or size > self.config.max_media_bytes:
+                raise HallError("这个视频的大小不可用")
+            mime = direct_mime(source)
+            media = MediaInfo(
+                media_id=media_id,
+                kind="jellyfin",
+                name=name,
+                size=size,
+                mime=mime,
+                playback_mode="direct",
+                duration=duration,
+                item_id=item_id,
+            )
+            return BuiltMedia(
+                media=media,
+                jellyfin_source=JellyfinSource(
+                    self.jellyfin, room.jellyfin, item_id, size, mime
+                ),
+            )
+
+        try:
+            hls = await self.jellyfin.open_transcode(room.jellyfin, item_id, 0.0, 1)
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+        media = MediaInfo(
+            media_id=media_id,
+            kind="jellyfin",
+            name=name,
+            size=0,
+            mime="application/vnd.apple.mpegurl",
+            playback_mode="hls",
+            duration=duration,
+            item_id=item_id,
+        )
+        return BuiltMedia(media=media, hls=hls)
 
     def _require_host(self, room: Room, host_token: str) -> None:
         if host_token != room.host_token:
@@ -311,18 +479,292 @@ class HallManager:
                 409,
             )
 
-    async def _upstream_for(self, media: MediaInfo) -> Optional[UpstreamSource]:
-        if media.kind != "url" or not media.url:
-            return None
-        if self._session is None:
-            raise HallError("hall is not started", "HALL_UNAVAILABLE", 503)
-        return UpstreamSource(
-            self._session,
-            media.url,
-            media.size,
-            media.mime,
-            media.range_supported,
+    async def _source_for(self, room: Room, media: MediaInfo) -> BuiltMedia:
+        """Rebuild the source objects for a playlist item that is re-activated."""
+        if media.kind == "url" and media.url:
+            if self._session is None:
+                raise HallError("hall is not started", "HALL_UNAVAILABLE", 503)
+            return BuiltMedia(
+                media=media,
+                upstream=UpstreamSource(
+                    self._session,
+                    media.url,
+                    media.size,
+                    media.mime,
+                    media.range_supported,
+                ),
+            )
+        if media.kind == "jellyfin":
+            if self.jellyfin is None or room.jellyfin is None:
+                raise HallError(
+                    "Jellyfin 登录已失效，请重新登录",
+                    protocol.ERR_JELLYFIN_AUTH_REQUIRED,
+                    401,
+                )
+            item_id = media.item_id or ""
+            if media.playback_mode == "hls":
+                try:
+                    hls = await self.jellyfin.open_transcode(
+                        room.jellyfin, item_id, 0.0, room.media_epoch + 1
+                    )
+                except JellyfinError as exc:
+                    raise HallError(exc.message, exc.code, exc.status_code)
+                return BuiltMedia(media=media, hls=hls)
+            return BuiltMedia(
+                media=media,
+                jellyfin_source=JellyfinSource(
+                    self.jellyfin, room.jellyfin, item_id, media.size, media.mime
+                ),
+            )
+        return BuiltMedia(media=media)
+
+    # -- jellyfin ------------------------------------------------------
+    def _require_jellyfin(self) -> JellyfinClient:
+        if self.jellyfin is None:
+            raise HallError(
+                "Jellyfin 源未启用", protocol.ERR_JELLYFIN_UNAVAILABLE, 503
+            )
+        return self.jellyfin
+
+    async def jellyfin_login(
+        self, room: Room, host_token: str, username: str, password: str
+    ) -> JellyfinSession:
+        self._require_host(room, host_token)
+        client = self._require_jellyfin()
+        device_id = f"srs-hall-{room.room_id}"
+        try:
+            session = await client.authenticate(username, password, device_id)
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+        room.jellyfin = session
+        room.touch()
+        logger.info(
+            "Jellyfin login room=%s user=%s", room.room_id, session.user_name
         )
+        return session
+
+    async def jellyfin_attach_token(
+        self, room: Room, host_token: str, token: str, user_id: Optional[str] = None
+    ) -> JellyfinSession:
+        """Adopt a token the browser remembered from an earlier login."""
+        self._require_host(room, host_token)
+        client = self._require_jellyfin()
+        device_id = f"srs-hall-{room.room_id}"
+        try:
+            session = await client.verify(token, device_id, user_id)
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+        room.jellyfin = session
+        room.touch()
+        return session
+
+    async def jellyfin_libraries(self, room: Room) -> List[Dict[str, Any]]:
+        client = self._require_jellyfin()
+        if room.jellyfin is None:
+            raise HallError(
+                "请先登录 Jellyfin", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
+            )
+        try:
+            return await client.libraries(room.jellyfin)
+        except JellyfinAuthError:
+            room.jellyfin = None
+            raise HallError(
+                "Jellyfin 登录已失效，请重新登录",
+                protocol.ERR_JELLYFIN_AUTH_FAILED,
+                401,
+            )
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+
+    async def jellyfin_items(
+        self,
+        room: Room,
+        host_token: str,
+        parent_id: Optional[str],
+        query: str,
+        start: int,
+        limit: int,
+    ) -> Dict[str, Any]:
+        # The library listing belongs to the host, not to whoever joined the
+        # room; only the host may ask what is in it.
+        self._require_host(room, host_token)
+        client = self._require_jellyfin()
+        if room.jellyfin is None:
+            raise HallError(
+                "请先登录 Jellyfin", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
+            )
+        try:
+            return await client.items(room.jellyfin, parent_id, query, start, limit)
+        except JellyfinAuthError:
+            room.jellyfin = None
+            raise HallError(
+                "Jellyfin 登录已失效，请重新登录",
+                protocol.ERR_JELLYFIN_AUTH_FAILED,
+                401,
+            )
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+
+    async def seek_transcode(self, room: Room, host_token: str, position: float) -> None:
+        self._require_host(room, host_token)
+        if room.media is None or room.media.playback_mode != "hls" or room.hls is None:
+            raise HallError("当前播放项不需要转码", protocol.ERR_BAD_MESSAGE, 400)
+        if room.jellyfin is None:
+            raise HallError(
+                "Jellyfin 登录已失效，请重新登录",
+                protocol.ERR_JELLYFIN_AUTH_REQUIRED,
+                401,
+            )
+        room.pending_seek = max(0.0, float(position))
+        task = self._seek_tasks.get(room.room_id)
+        if task is None or task.done():
+            task = asyncio.create_task(self._run_seek(room))
+            self._seek_tasks[room.room_id] = task
+
+    async def _run_seek(self, room: Room) -> None:
+        delay = self.config.jellyfin.seek_debounce_ms / 1000.0
+        try:
+            while True:
+                target = room.pending_seek
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if room.pending_seek != target:
+                    continue
+                break
+            await self._restart_transcode(room, target)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Jellyfin seek restart failed room=%s", room.room_id)
+        finally:
+            if self._seek_tasks.get(room.room_id) is asyncio.current_task():
+                self._seek_tasks.pop(room.room_id, None)
+
+    async def _restart_transcode(self, room: Room, position: float) -> None:
+        client = self.jellyfin
+        session = room.jellyfin
+        old = room.hls
+        if client is None or session is None or old is None or room.ended:
+            return
+        try:
+            fresh = await client.open_transcode(
+                session, old.item_id, position, old.epoch + 1
+            )
+        except JellyfinAuthError:
+            room.jellyfin = None
+            logger.info("Jellyfin seek needs a new login room=%s", room.room_id)
+            return
+        except JellyfinError as exc:
+            logger.warning(
+                "Jellyfin seek failed room=%s position=%s: %s",
+                room.room_id,
+                position,
+                exc.message,
+            )
+            return
+        await client.stop_transcode(session, old)
+        room.hls = fresh
+        # Cached segments belong to the stream that is now gone.
+        room.cache = BlockCache(room.cache.block_size, room.cache.max_bytes)
+        await self.broadcast_room(room)
+        logger.info(
+            "Jellyfin transcode restarted room=%s position=%.1f epoch=%d",
+            room.room_id,
+            position,
+            fresh.epoch,
+        )
+
+    async def hls_playlist(self, room: Room) -> str:
+        client = self.jellyfin
+        session = room.jellyfin
+        if client is None or session is None or room.hls is None or room.media is None:
+            raise HallError(
+                "转码会话不存在", protocol.ERR_JELLYFIN_TRANSCODE_FAILED, 404
+            )
+        media = room.media
+        epoch = room.media_epoch
+        try:
+            return await client.render_playlist(
+                session,
+                room.hls,
+                lambda index: self.auth.hls_segment_url(
+                    room.room_id, media.media_id, epoch, index
+                ),
+            )
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+
+    async def hls_segment(self, room: Room, index: int) -> bytes:
+        client = self.jellyfin
+        session = room.jellyfin
+        if client is None or session is None or room.hls is None:
+            raise HallError(
+                "转码会话不存在", protocol.ERR_JELLYFIN_TRANSCODE_FAILED, 404
+            )
+        try:
+            return await room.cache.get_or_fetch(
+                index,
+                lambda: client.read_segment(session, room.hls, index),
+            )
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+
+    def _stop_room_transcode(self, room: Room) -> None:
+        task = self._seek_tasks.pop(room.room_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+        hls = room.hls
+        session = room.jellyfin
+        room.hls = None
+        if hls is not None and session is not None and self.jellyfin is not None:
+            asyncio.create_task(self.jellyfin.stop_transcode(session, hls))
+
+    def _spawn_jellyfin_subtitles(self, room: Room, media: MediaInfo) -> None:
+        """Pull the item's text subtitle tracks in the background."""
+        if media.kind != "jellyfin" or self.jellyfin is None or room.jellyfin is None:
+            return
+        source = room.jellyfin_media_source or {}
+        tracks = text_subtitle_streams(source)
+        if not tracks:
+            return
+        task = asyncio.create_task(self._load_jellyfin_subtitles(room, media, tracks))
+        self._subtitle_tasks.add(task)
+        task.add_done_callback(self._subtitle_tasks.discard)
+
+    async def _load_jellyfin_subtitles(
+        self, room: Room, media: MediaInfo, tracks: List[Dict[str, Any]]
+    ) -> None:
+        session = room.jellyfin
+        if session is None or self.jellyfin is None:
+            return
+        source_id = str((room.jellyfin_media_source or {}).get("Id") or media.item_id or "")
+        for track in tracks:
+            if room.ended or room.media is None or room.media.media_id != media.media_id:
+                return
+            try:
+                index = int(track.get("Index"))
+            except (TypeError, ValueError):
+                continue
+            text = await self.jellyfin.subtitle_vtt(session, media.item_id or "", source_id, index)
+            if not text:
+                continue
+            if len(room.subtitles) >= MAX_SUBTITLES_PER_ROOM:
+                return
+            language = str(track.get("Language") or "und")[:16]
+            label = str(track.get("DisplayTitle") or track.get("Title") or language)
+            subtitle = Subtitle(
+                subtitle_id="sub_" + os.urandom(8).hex(),
+                name=sanitize_name(f"{label}.vtt"),
+                lang=sanitize_lang(language),
+                data=text.encode("utf-8"),
+                size=len(text.encode("utf-8")),
+                media_id=media.media_id,
+            )
+            room.subtitles[subtitle.subtitle_id] = subtitle
+            if room.active_subtitle_id is None and room.media and room.media.media_id == media.media_id:
+                room.active_subtitle_id = subtitle.subtitle_id
+                room.active_subtitle_visible = True
+            await self.broadcast_room(room)
 
     async def change_media(
         self, room: Room, host_token: str, media_payload: Dict[str, Any]
@@ -330,9 +772,11 @@ class HallManager:
         """Swap the playing file; it becomes the newest playlist entry."""
         self._require_host(room, host_token)
         self._ensure_playlist_capacity(room)
-        media, upstream = await self._build_media(media_payload)
+        built = await self._build_media(media_payload, room)
+        media = built.media
         room.add_playlist_item(media)
-        room.replace_media(media, upstream)
+        room.replace_media(media, built.upstream, built.jellyfin_source, built.hls)
+        self._spawn_jellyfin_subtitles(room, media)
         await self.broadcast_room(room)
         logger.info(
             "Room media changed room=%s media=%s size=%d kind=%s playlist=%d",
@@ -350,11 +794,13 @@ class HallManager:
         """Append an item; an empty room starts playing the first one."""
         self._require_host(room, host_token)
         self._ensure_playlist_capacity(room)
-        media, upstream = await self._build_media(media_payload)
+        built = await self._build_media(media_payload, room)
+        media = built.media
         room.add_playlist_item(media)
         activated = room.media is None
         if activated:
-            room.replace_media(media, upstream)
+            room.replace_media(media, built.upstream, built.jellyfin_source, built.hls)
+            self._spawn_jellyfin_subtitles(room, media)
         await self.broadcast_room(room)
         logger.info(
             "Playlist item added room=%s media=%s size=%d kind=%s active=%s",
@@ -371,8 +817,9 @@ class HallManager:
         media = room.playlist.get(media_id)
         if media is None:
             raise HallError("media not found", protocol.ERR_MEDIA_NOT_FOUND, 404)
-        upstream = await self._upstream_for(media)
-        room.replace_media(media, upstream)
+        built = await self._source_for(room, media)
+        room.replace_media(media, built.upstream, built.jellyfin_source, built.hls)
+        self._spawn_jellyfin_subtitles(room, media)
         await self.broadcast_room(room)
         logger.info(
             "Playlist item selected room=%s media=%s", room.room_id, media.media_id
@@ -390,8 +837,11 @@ class HallManager:
         if was_active:
             next_media = room.playlist.get(following) if following else None
             if next_media is not None:
-                upstream = await self._upstream_for(next_media)
-                room.replace_media(next_media, upstream)
+                built = await self._source_for(room, next_media)
+                room.replace_media(
+                    next_media, built.upstream, built.jellyfin_source, built.hls
+                )
+                self._spawn_jellyfin_subtitles(room, next_media)
             else:
                 room.clear_media()
         await self.broadcast_room(room)
@@ -653,6 +1103,7 @@ class HallManager:
         if self._codes.get(room.room_code) == room.room_id:
             self._codes.pop(room.room_code, None)
         self._ended_at.pop(room.room_id, None)
+        self._stop_room_transcode(room)
         room.cache.clear()
 
     async def _pulse_loop(self) -> None:

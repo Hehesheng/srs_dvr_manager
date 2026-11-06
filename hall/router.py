@@ -33,6 +33,21 @@ class MediaPayload(BaseModel):
     size: int = 0
     mime: str = "application/octet-stream"
     url: Optional[str] = None
+    # Jellyfin items are addressed by id; the server owns every credential.
+    item_id: Optional[str] = None
+
+
+class JellyfinLoginRequest(BaseModel):
+    username: str = Field(default="", max_length=64)
+    password: str = Field(default="", max_length=256)
+    token: Optional[str] = None
+    # Returned by the login call and echoed back with a remembered token, so
+    # the server can look the account up without relying on /Users/Me.
+    user_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class HlsSeekRequest(BaseModel):
+    position: float = 0.0
 
 
 class CreateRoomRequest(BaseModel):
@@ -224,6 +239,110 @@ async def join_room(room_ref: str, payload: JoinRequest, request: Request):
         "ws_url": f"/hall/ws/{room.room_id}",
         "room": room.public_info(),
     }
+
+
+@router.post("/api/rooms/{room_ref}/jellyfin/session")
+async def jellyfin_session(
+    room_ref: str,
+    payload: JellyfinLoginRequest,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    """Sign the host in to Jellyfin, or adopt a token the browser remembered.
+
+    The password is used for this one call and never stored.  The resulting
+    token stays on the room and is never returned to a client.
+    """
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        if payload.token:
+            session = await hall.jellyfin_attach_token(
+                room, x_host_token or "", payload.token, payload.user_id
+            )
+        else:
+            session = await hall.jellyfin_login(
+                room,
+                x_host_token or "",
+                payload.username.strip(),
+                payload.password,
+            )
+        libraries = await hall.jellyfin_libraries(room)
+    except HallError as exc:
+        return _hall_error(exc)
+    # The host gets the token back so this browser can stay signed in for a
+    # week.  It is the host's own credential — every other endpoint, and every
+    # payload a member can read, stays free of it.
+    return {"jellyfin": session.public(), "libraries": libraries, "token": session.token}
+
+
+@router.get("/api/rooms/{room_ref}/jellyfin/items")
+async def jellyfin_items(
+    room_ref: str,
+    request: Request,
+    library: Optional[str] = Query(default=None),
+    q: str = Query(default=""),
+    start: int = Query(default=0),
+    limit: int = Query(default=60),
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        return await hall.jellyfin_items(room, x_host_token or "", library, q, start, limit)
+    except HallError as exc:
+        return _hall_error(exc)
+
+
+@router.get("/api/rooms/{room_ref}/jellyfin/status")
+async def jellyfin_status(room_ref: str, request: Request):
+    """What the host view needs to know before it shows the Jellyfin menu."""
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    config = hall.config.jellyfin
+    return {
+        "enabled": bool(config.enabled and hall.jellyfin is not None),
+        "authenticated": room.jellyfin is not None,
+        "jellyfin": room.jellyfin.public() if room.jellyfin else None,
+        "max_bitrate": config.max_bitrate,
+    }
+
+
+@router.post("/api/rooms/{room_ref}/hls/seek")
+async def hls_seek(
+    room_ref: str,
+    payload: HlsSeekRequest,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    """Restart the room's transcode at a new position.
+
+    The response carries the room's new playlist URL; every client's
+    ``media_epoch`` moves with it, which is how members know to reload.
+    """
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        await hall.seek_transcode(room, x_host_token or "", payload.position)
+    except HallError as exc:
+        return _hall_error(exc)
+    return {"code": 0, "position": round(payload.position, 3)}
 
 
 @router.get("/api/rooms/{room_ref}")
@@ -482,3 +601,87 @@ async def media_get(
         body = stream_range(room, request, target, hall.config.block_size)
 
     return StreamingResponse(body, status_code=response_status, headers=headers)
+
+
+HLS_HEADERS = {
+    "Cache-Control": "private, no-store",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _hls_or_error(
+    request: Request, room_ref: str, media_id: str, epoch: int, exp: int, sig: str
+):
+    hall = _hall(request)
+    if hall is None:
+        return None, None, _error_json(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable"
+        )
+    room = hall.get_room(room_ref)
+    if room is None:
+        return None, None, _error_json(status.HTTP_404_NOT_FOUND, "ROOM_NOT_FOUND", "room not found")
+    if room.ended:
+        return None, None, _error_json(status.HTTP_410_GONE, "ROOM_ENDED", "room has ended")
+    if room.media is None or room.media.media_id != media_id:
+        return None, None, _error_json(status.HTTP_404_NOT_FOUND, "MEDIA_NOT_FOUND", "media not found")
+    if not hall.auth.verify_hls(room.room_id, media_id, epoch, exp, sig):
+        return None, None, _error_json(
+            status.HTTP_403_FORBIDDEN, "SIGNATURE_INVALID", "media URL is invalid or expired"
+        )
+    if epoch != room.media_epoch:
+        # The transcode was restarted; the old playlist must not be followed.
+        return None, None, _error_json(
+            status.HTTP_409_CONFLICT, "STREAM_RESTARTED", "转码已重新开始，请重新加载播放地址"
+        )
+    return hall, room, None
+
+
+@router.get("/media/{room_ref}/{media_id}/live.m3u8")
+async def hls_playlist(
+    room_ref: str,
+    media_id: str,
+    request: Request,
+    epoch: int = Query(...),
+    exp: int = Query(...),
+    sig: str = Query(...),
+):
+    hall, room, error = _hls_or_error(request, room_ref, media_id, epoch, exp, sig)
+    if error is not None:
+        return error
+    if room.media is None or room.media.playback_mode != "hls":
+        return _error_json(
+            status.HTTP_404_NOT_FOUND, "MEDIA_NOT_FOUND", "this item is not transcoded"
+        )
+    try:
+        text = await hall.hls_playlist(room)
+    except HallError as exc:
+        return _hall_error(exc)
+    return Response(
+        content=text,
+        media_type="application/vnd.apple.mpegurl",
+        headers=HLS_HEADERS,
+    )
+
+
+@router.get("/media/{room_ref}/{media_id}/seg/{index}.ts")
+async def hls_segment(
+    room_ref: str,
+    media_id: str,
+    index: int,
+    request: Request,
+    epoch: int = Query(...),
+    exp: int = Query(...),
+    sig: str = Query(...),
+):
+    hall, room, error = _hls_or_error(request, room_ref, media_id, epoch, exp, sig)
+    if error is not None:
+        return error
+    if room.media is None or room.media.playback_mode != "hls":
+        return _error_json(
+            status.HTTP_404_NOT_FOUND, "MEDIA_NOT_FOUND", "this item is not transcoded"
+        )
+    try:
+        data = await hall.hls_segment(room, index)
+    except HallError as exc:
+        return _hall_error(exc)
+    return Response(content=data, media_type="video/mp2t", headers=HLS_HEADERS)
