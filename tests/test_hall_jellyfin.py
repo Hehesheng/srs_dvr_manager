@@ -6,10 +6,14 @@ from fastapi.testclient import TestClient
 
 import api
 from hall.jellyfin import (
+    DEFAULT_TRANSCODE_BITRATE,
+    MAX_TRANSCODE_BITRATE,
+    MIN_TRANSCODE_BITRATE,
     HlsSession,
     JellyfinClient,
     JellyfinError,
     JellyfinSession,
+    clamp_bitrate,
     clean_vtt,
     playback_mode,
     subtitle_streams,
@@ -221,7 +225,7 @@ class FakeJellyfinClient(JellyfinClient):
         return "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n你好\n"
 
 
-def _client(monkeypatch):
+def _client(monkeypatch, max_bitrate=8_000_000):
     monkeypatch.setattr(api, "WebDavRecordManager", FakeRecordManager)
 
     def factory(cls, config_path="config.yaml"):
@@ -230,7 +234,7 @@ def _client(monkeypatch):
                 jellyfin=JellyfinConfig(
                     enabled=True,
                     url="http://jelly.invalid",
-                    max_bitrate=8_000_000,
+                    max_bitrate=max_bitrate,
                     seek_debounce_ms=0,
                 )
             )
@@ -1200,6 +1204,131 @@ def test_switching_a_playlist_back_to_a_transcoded_item_keeps_its_subtitles(monk
         assert info["jellyfin_subtitle"] == 3
         assert _hall(client).rooms[room["room_id"]].hls.subtitle_index == 3
         assert fake.opened[-1][0] == "/Items/hls-1/PlaybackInfo"
+
+
+# -- transcode quality -------------------------------------------------
+
+
+def test_clamping_keeps_a_bitrate_inside_what_the_server_may_pull():
+    assert clamp_bitrate(None) == DEFAULT_TRANSCODE_BITRATE
+    assert clamp_bitrate("nonsense") == DEFAULT_TRANSCODE_BITRATE
+    assert clamp_bitrate(0) == MIN_TRANSCODE_BITRATE
+    assert clamp_bitrate(4_000_000) == 4_000_000
+    assert clamp_bitrate(99_000_000) == MAX_TRANSCODE_BITRATE
+    # The configured ceiling wins over anything above it.
+    assert clamp_bitrate(20_000_000, ceiling=8_000_000) == 8_000_000
+    assert clamp_bitrate(4_000_000, ceiling=8_000_000) == 4_000_000
+
+
+def test_a_room_starts_below_the_servers_ceiling(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        state = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        assert state["jellyfin_bitrate"] == DEFAULT_TRANSCODE_BITRATE
+        assert state["jellyfin_bitrate_max"] == 8_000_000
+
+    # A server configured for less never hands out more.
+    with _client(monkeypatch, max_bitrate=4_000_000) as client:
+        _fake(client)
+        room = _create_room(client)
+        state = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        assert state["jellyfin_bitrate"] == 4_000_000
+        assert state["jellyfin_bitrate_max"] == 4_000_000
+
+
+def test_the_transcode_asks_for_the_rooms_bitrate(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        assert fake.profiles[-1]["MaxStreamingBitrate"] == DEFAULT_TRANSCODE_BITRATE
+
+
+def test_the_host_can_lower_the_quality_and_everyone_follows(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        assert fake.profiles[-1]["MaxStreamingBitrate"] == DEFAULT_TRANSCODE_BITRATE
+
+        lowered = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/bitrate",
+            json={"bitrate": 4_000_000, "position": 120.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert lowered.status_code == 200, lowered.text
+        assert lowered.json()["bitrate"] == 4_000_000
+        # A quality change restarts the transcode where the room is, exactly
+        # like a seek, so members are pulled onto the new stream.
+        info = _wait_epoch(client, room, 2)
+        assert info["media_epoch"] == 2
+        assert info["media_start"] == 120.0
+        assert info["jellyfin_bitrate"] == 4_000_000
+        assert fake.opened[-1] == ("/Items/hls-1/PlaybackInfo", 120 * 10_000_000)
+        assert fake.profiles[-1]["MaxStreamingBitrate"] == 4_000_000
+        assert fake.stopped, "the previous transcoding session was left running"
+
+        # The choice outlives the restart that carried it.
+        seek = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/seek",
+            json={"position": 300.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert seek.status_code == 200
+        _wait_epoch(client, room, 3)
+        assert fake.profiles[-1]["MaxStreamingBitrate"] == 4_000_000
+
+
+def test_a_bitrate_above_the_ceiling_is_clamped_not_refused(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        reply = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/bitrate",
+            json={"bitrate": 99_000_000, "position": 0.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert reply.status_code == 200, reply.text
+        assert reply.json()["bitrate"] == 8_000_000
+        assert reply.json()["max_bitrate"] == 8_000_000
+
+
+def test_quality_can_be_set_before_anything_plays(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        reply = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/bitrate",
+            json={"bitrate": 3_000_000, "position": 0.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert reply.status_code == 200, reply.text
+        # Nothing to restart yet, and the next transcode uses the choice.
+        _item(client, room, "hls-1")
+        assert fake.profiles[-1]["MaxStreamingBitrate"] == 3_000_000
+
+
+def test_the_quality_choice_is_host_only(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        member = client.post(
+            f"/hall/api/rooms/{room['room_code']}/join", json={"name": "bob"}
+        ).json()
+        denied = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/bitrate",
+            json={"bitrate": 2_000_000, "position": 10.0},
+            headers={"X-Host-Token": member["member_token"]},
+        )
+        assert denied.status_code == 403
 
 
 def test_reported_token_never_appears_in_a_room_state(monkeypatch):

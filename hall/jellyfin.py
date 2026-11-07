@@ -36,6 +36,27 @@ DIRECT_AUDIO = {"aac", "mp3", "opus", "vorbis"}
 # Text tracks Jellyfin can convert to WebVTT; PGS/VOBSUB are images and cannot.
 TEXT_SUBTITLE_CODECS = {"ass", "ssa", "srt", "subrip", "vtt", "webvtt", "mov_text"}
 
+# Transcode quality.  A burned-in subtitle is re-encoded, so the room starts
+# below the raw source bitrate and the host can move it from there.
+DEFAULT_TRANSCODE_BITRATE = 6_000_000
+MIN_TRANSCODE_BITRATE = 1_000_000
+MAX_TRANSCODE_BITRATE = 40_000_000
+
+
+def clamp_bitrate(value: Any, ceiling: Optional[int] = None) -> int:
+    """Keep a requested bitrate inside what Jellyfin can be asked for."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = DEFAULT_TRANSCODE_BITRATE
+    top = MAX_TRANSCODE_BITRATE
+    if ceiling is not None:
+        try:
+            top = min(top, max(MIN_TRANSCODE_BITRATE, int(ceiling)))
+        except (TypeError, ValueError):
+            pass
+    return max(MIN_TRANSCODE_BITRATE, min(top, number))
+
 MIME_BY_CONTAINER = {
     "mp4": "video/mp4",
     "m4v": "video/mp4",
@@ -338,7 +359,8 @@ class JellyfinClient:
     def __init__(self, session: aiohttp.ClientSession, base_url: str, max_bitrate: int) -> None:
         self.session = session
         self.base_url = (base_url or "").rstrip("/")
-        self.max_bitrate = max(1_000_000, int(max_bitrate))
+        # The ceiling this server was configured for; rooms pick below it.
+        self.max_bitrate = clamp_bitrate(max_bitrate, ceiling=None)
 
     # -- plumbing ------------------------------------------------------
     def _headers(self, token: Optional[str], device_id: str) -> Dict[str, str]:
@@ -644,7 +666,9 @@ class JellyfinClient:
             raise JellyfinError(f"连接 Jellyfin 失败: {exc}", "JELLYFIN_UNAVAILABLE", 502)
 
     # -- transcoding ---------------------------------------------------
-    def _device_profile(self, subtitles_off: bool = False) -> Dict[str, Any]:
+    def _device_profile(
+        self, subtitles_off: bool = False, max_bitrate: Optional[int] = None
+    ) -> Dict[str, Any]:
         # An empty SubtitleProfiles list says "this client cannot show any
         # subtitle", which makes Jellyfin burn the account's default track into
         # the picture.  Declaring text formats as external instead means no
@@ -656,7 +680,10 @@ class JellyfinClient:
                 for codec in ("srt", "subrip", "ass", "ssa", "vtt", "webvtt")
             ]
         return {
-            "MaxStreamingBitrate": self.max_bitrate,
+            "MaxStreamingBitrate": clamp_bitrate(
+                self.max_bitrate if max_bitrate is None else max_bitrate,
+                ceiling=self.max_bitrate,
+            ),
             "DirectPlayProfiles": [
                 {
                     "Container": "mp4,m4v,webm,mov",
@@ -690,6 +717,7 @@ class JellyfinClient:
         epoch: int,
         subtitle_index: Optional[int] = None,
         subtitles_off: bool = False,
+        max_bitrate: Optional[int] = None,
     ) -> HlsSession:
         """Start (or restart) a transcoding session at ``start_seconds``.
 
@@ -699,13 +727,17 @@ class JellyfinClient:
         together with a fresh ``PlaySessionId``, without which Jellyfin keeps
         serving the previous session's segments.
         """
+        bitrate = clamp_bitrate(
+            self.max_bitrate if max_bitrate is None else max_bitrate,
+            ceiling=self.max_bitrate,
+        )
         body = {
             "UserId": session.user_id,
             "StartTimeTicks": int(max(0.0, start_seconds) * 10_000_000),
             "IsPlayback": True,
             "AutoOpenLiveStream": True,
-            "MaxStreamingBitrate": self.max_bitrate,
-            "DeviceProfile": self._device_profile(subtitles_off),
+            "MaxStreamingBitrate": bitrate,
+            "DeviceProfile": self._device_profile(subtitles_off, bitrate),
         }
         payload = await self._json(
             "POST",

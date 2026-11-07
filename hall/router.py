@@ -56,6 +56,12 @@ class HlsSubtitleRequest(BaseModel):
     position: float = 0.0
 
 
+class HlsBitrateRequest(BaseModel):
+    # Bits per second; the room clamps it to what the server may pull.
+    bitrate: int
+    position: float = 0.0
+
+
 class CreateRoomRequest(BaseModel):
     name: str = Field(default="Media Room", max_length=64)
     # Optional: a host may open the room first and fill the playlist later.
@@ -391,6 +397,33 @@ async def hls_subtitle(
         "subtitle": room.jellyfin_subtitle,
         "subtitles_off": room.jellyfin_subtitles_off,
     }
+
+
+@router.post("/api/rooms/{room_ref}/hls/bitrate")
+async def hls_bitrate(
+    room_ref: str,
+    payload: HlsBitrateRequest,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    """Set the transcode quality for this room (host only).
+
+    A running transcode is restarted at ``position`` so everyone follows, the
+    same way a subtitle change or a seek works.
+    """
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        bitrate = await hall.set_transcode_quality(
+            room, x_host_token or "", payload.bitrate, payload.position
+        )
+    except HallError as exc:
+        return _hall_error(exc)
+    return {"code": 0, "bitrate": bitrate, "max_bitrate": room.jellyfin_bitrate_max}
 
 
 @router.get("/api/rooms/{room_ref}")

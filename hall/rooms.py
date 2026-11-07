@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from .auth import HallAuth
 from .cache import BlockCache
 from .host_source import HostSource, SourceOffline
+from .jellyfin import DEFAULT_TRANSCODE_BITRATE, MAX_TRANSCODE_BITRATE
 from .subtitles import Subtitle
 from .timeline import HostTimeline
 from .upstream import UpstreamSource
@@ -136,6 +137,11 @@ class Room:
         # ``jellyfin_subtitles_off`` set to ask Jellyfin for no subtitles.
         self.jellyfin_subtitle: Optional[int] = None
         self.jellyfin_subtitles_off: bool = False
+        # Transcode quality for this room.  The host moves it from the control
+        # bar; ``jellyfin_bitrate_max`` is the server's ceiling, held here so
+        # the picker knows how far it may go.
+        self.jellyfin_bitrate: int = DEFAULT_TRANSCODE_BITRATE
+        self.jellyfin_bitrate_max: int = MAX_TRANSCODE_BITRATE
         # Latest seek the host asked for while a restart was already running.
         self.pending_seek: float = 0.0
         self.members: Dict[str, Member] = {}
@@ -440,6 +446,8 @@ class Room:
             "jellyfin_subtitles": self.jellyfin_subtitle_tracks,
             "jellyfin_subtitle": self.jellyfin_subtitle,
             "jellyfin_subtitles_off": self.jellyfin_subtitles_off,
+            "jellyfin_bitrate": self.jellyfin_bitrate,
+            "jellyfin_bitrate_max": self.jellyfin_bitrate_max,
             "ended": self.ended,
         }
 
@@ -477,6 +485,8 @@ class Room:
             "jellyfin_subtitles": self.jellyfin_subtitle_tracks,
             "jellyfin_subtitle": self.jellyfin_subtitle,
             "jellyfin_subtitles_off": self.jellyfin_subtitles_off,
+            "jellyfin_bitrate": self.jellyfin_bitrate,
+            "jellyfin_bitrate_max": self.jellyfin_bitrate_max,
             "cache": {
                 "bytes": self.cache.bytes_used,
                 "hits": self.cache.hits,

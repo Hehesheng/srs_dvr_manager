@@ -20,6 +20,8 @@ from .jellyfin import (
     JellyfinError,
     JellyfinSession,
     JellyfinSource,
+    clamp_bitrate,
+    DEFAULT_TRANSCODE_BITRATE,
     direct_mime,
     duration_seconds,
     item_kind,
@@ -321,6 +323,10 @@ class HallManager:
         )
         while room.room_code in self._codes:
             room.room_code = self.auth.new_room_code()
+        # Quality starts at the room default, never above what this server was
+        # configured to pull; the host can lower or raise it inside that range.
+        room.jellyfin_bitrate_max = clamp_bitrate(self.config.jellyfin.max_bitrate)
+        room.jellyfin_bitrate = min(DEFAULT_TRANSCODE_BITRATE, room.jellyfin_bitrate_max)
         self.rooms[room.room_id] = room
         self._codes[room.room_code] = room.room_id
         logger.info(
@@ -465,7 +471,13 @@ class HallManager:
             )
 
         try:
-            hls = await self.jellyfin.open_transcode(room.jellyfin, item_id, 0.0, 1)
+            hls = await self.jellyfin.open_transcode(
+                room.jellyfin,
+                item_id,
+                0.0,
+                1,
+                max_bitrate=room.jellyfin_bitrate,
+            )
         except JellyfinError as exc:
             raise HallError(exc.message, exc.code, exc.status_code)
         media = MediaInfo(
@@ -553,7 +565,11 @@ class HallManager:
             if media.playback_mode == "hls":
                 try:
                     hls = await self.jellyfin.open_transcode(
-                        room.jellyfin, item_id, 0.0, room.media_epoch + 1
+                        room.jellyfin,
+                        item_id,
+                        0.0,
+                        room.media_epoch + 1,
+                        max_bitrate=room.jellyfin_bitrate,
                     )
                 except JellyfinError as exc:
                     raise HallError(exc.message, exc.code, exc.status_code)
@@ -674,6 +690,30 @@ class HallManager:
             task = asyncio.create_task(self._run_seek(room))
             self._seek_tasks[room.room_id] = task
 
+    async def set_transcode_quality(
+        self, room: Room, host_token: str, bitrate: int, position: float = 0.0
+    ) -> int:
+        """Set the room's transcode bitrate, restarting the transcode if one runs.
+
+        The host owns this: it changes what every member receives, so the
+        change travels through the same restart as a seek and publishes a new
+        epoch for members to follow.  Rooms with nothing to transcode just
+        remember the setting for the next item.
+        """
+        self._require_host(room, host_token)
+        room.jellyfin_bitrate = clamp_bitrate(bitrate, ceiling=room.jellyfin_bitrate_max)
+        if room.media is not None and room.media.playback_mode == "hls" and room.hls is not None:
+            if room.jellyfin is None:
+                raise HallError(
+                    "Jellyfin 登录已失效，请重新登录",
+                    protocol.ERR_JELLYFIN_AUTH_REQUIRED,
+                    401,
+                )
+            await self._restart_transcode(room, max(0.0, float(position)))
+        else:
+            await self.broadcast_room(room)
+        return room.jellyfin_bitrate
+
     async def set_transcode_subtitle(
         self,
         room: Room,
@@ -763,6 +803,7 @@ class HallManager:
                 old.epoch + 1,
                 subtitle_index=room.jellyfin_subtitle,
                 subtitles_off=room.jellyfin_subtitles_off,
+                max_bitrate=room.jellyfin_bitrate,
             )
         except JellyfinAuthError:
             room.jellyfin = None
