@@ -96,6 +96,9 @@ class BuiltMedia:
     upstream: Optional[UpstreamSource] = None
     jellyfin_source: Optional[JellyfinSource] = None
     hls: Optional[HlsSession] = None
+    # The Jellyfin MediaSource behind this item; the room only adopts its
+    # subtitle state once this item is the one actually playing.
+    jellyfin_item: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -475,7 +478,25 @@ class HallManager:
             duration=duration,
             item_id=item_id,
         )
-        return BuiltMedia(media=media, hls=hls)
+        return BuiltMedia(media=media, hls=hls, jellyfin_item=source)
+
+    def _apply_jellyfin_item(self, room: Room, built: "BuiltMedia") -> None:
+        """Adopt a Jellyfin item's subtitle state, once it is the active media.
+
+        Every item carries its own tracks, so this has to run on each switch —
+        leaving the previous item's (empty) list in place is how the CC menu
+        went blank after visiting a direct-play film.
+        """
+        if built.media.kind != "jellyfin" or built.jellyfin_item is None:
+            return
+        source = built.jellyfin_item
+        room.jellyfin_item = source
+        # Direct play has no burn-in, so it has no tracks to offer.
+        room.jellyfin_subtitle_tracks = (
+            subtitle_streams(source) if built.media.playback_mode == "hls" else []
+        )
+        room.jellyfin_subtitle = None
+        room.jellyfin_subtitles_off = False
 
     def _require_host(self, room: Room, host_token: str) -> None:
         if host_token != room.host_token:
@@ -514,6 +535,21 @@ class HallManager:
                     401,
                 )
             item_id = media.item_id or ""
+            # Re-read the item: the subtitle list belongs to this title, and
+            # the room may have been playing something else in between.
+            try:
+                item = await self.jellyfin.item(room.jellyfin, item_id)
+            except JellyfinAuthError:
+                room.jellyfin = None
+                raise HallError(
+                    "Jellyfin 登录已失效，请重新登录",
+                    protocol.ERR_JELLYFIN_AUTH_FAILED,
+                    401,
+                )
+            except JellyfinError as exc:
+                raise HallError(exc.message, exc.code, exc.status_code)
+            sources = item.get("MediaSources") or [{}]
+            source = sources[0]
             if media.playback_mode == "hls":
                 try:
                     hls = await self.jellyfin.open_transcode(
@@ -521,12 +557,13 @@ class HallManager:
                     )
                 except JellyfinError as exc:
                     raise HallError(exc.message, exc.code, exc.status_code)
-                return BuiltMedia(media=media, hls=hls)
+                return BuiltMedia(media=media, hls=hls, jellyfin_item=source)
             return BuiltMedia(
                 media=media,
                 jellyfin_source=JellyfinSource(
                     self.jellyfin, room.jellyfin, item_id, media.size, media.mime
                 ),
+                jellyfin_item=source,
             )
         return BuiltMedia(media=media)
 
@@ -596,6 +633,7 @@ class HallManager:
         query: str,
         start: int,
         limit: int,
+        mode: str = "children",
     ) -> Dict[str, Any]:
         # The library listing belongs to the host, not to whoever joined the
         # room; only the host may ask what is in it.
@@ -605,8 +643,11 @@ class HallManager:
             raise HallError(
                 "请先登录 Jellyfin", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
             )
+        mode = mode if mode in ("children", "episodes") else "children"
         try:
-            return await client.items(room.jellyfin, parent_id, query, start, limit)
+            return await client.items(
+                room.jellyfin, parent_id, query, start, limit, mode
+            )
         except JellyfinAuthError:
             room.jellyfin = None
             raise HallError(
@@ -852,6 +893,7 @@ class HallManager:
         built = await self._build_media(media_payload, room)
         media = built.media
         room.add_playlist_item(media)
+        self._apply_jellyfin_item(room, built)
         room.replace_media(media, built.upstream, built.jellyfin_source, built.hls)
         self._spawn_jellyfin_subtitles(room, media)
         await self.broadcast_room(room)
@@ -876,6 +918,8 @@ class HallManager:
         room.add_playlist_item(media)
         activated = room.media is None
         if activated:
+            # Only the item that actually starts playing owns the subtitle state.
+            self._apply_jellyfin_item(room, built)
             room.replace_media(media, built.upstream, built.jellyfin_source, built.hls)
             self._spawn_jellyfin_subtitles(room, media)
         await self.broadcast_room(room)
@@ -895,6 +939,7 @@ class HallManager:
         if media is None:
             raise HallError("media not found", protocol.ERR_MEDIA_NOT_FOUND, 404)
         built = await self._source_for(room, media)
+        self._apply_jellyfin_item(room, built)
         room.replace_media(media, built.upstream, built.jellyfin_source, built.hls)
         self._spawn_jellyfin_subtitles(room, media)
         await self.broadcast_room(room)

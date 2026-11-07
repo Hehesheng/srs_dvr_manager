@@ -1152,6 +1152,56 @@ def test_a_direct_item_loads_vtt_tracks_but_a_transcoded_one_does_not(monkeypatc
         assert fake.subtitle_calls == []
 
 
+def test_switching_a_playlist_back_to_a_transcoded_item_keeps_its_subtitles(monkeypatch):
+    """Switching items must re-publish the new item's subtitle state.
+
+    The tracks used to be captured when the item was *added*, so returning to
+    a transcoded item left the CC menu empty: the direct item had just written
+    an empty track list over it.
+    """
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        code = room["room_code"]
+        headers = {"X-Host-Token": room["host_token"]}
+
+        def activate(media_id):
+            response = client.post(f"/hall/api/rooms/{code}/playlist/{media_id}/activate", headers=headers)
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        first = _item(client, room, "hls-1").json()
+        assert [track["index"] for track in first["room"]["jellyfin_subtitles"]] == [2, 3, 4]
+
+        # A direct item has no burn-in, so its WebVTT track replaces the list.
+        direct = _item(client, room, "direct-1").json()
+        body = activate(direct["media_id"])
+        assert body["media"]["playback_mode"] == "direct"
+        assert body["room"]["jellyfin_subtitles"] == []
+
+        # Back to the transcoded item: the tracks must come back, and the host
+        # must be able to pick one again.
+        body = activate(first["media_id"])
+        assert body["media"]["playback_mode"] == "hls"
+        assert [track["index"] for track in body["room"]["jellyfin_subtitles"]] == [2, 3, 4]
+        assert body["room"]["jellyfin_subtitle"] is None
+        assert body["room"]["jellyfin_subtitles_off"] is False
+
+        epoch = body["room"]["media_epoch"]
+        pick = client.post(
+            f"/hall/api/rooms/{code}/hls/subtitle",
+            json={"subtitle": 3, "position": 30.0},
+            headers=headers,
+        )
+        assert pick.status_code == 200, pick.text
+        assert pick.json()["subtitle"] == 3
+        info = _wait_epoch(client, room, epoch + 1)
+        assert info["jellyfin_subtitle"] == 3
+        assert _hall(client).rooms[room["room_id"]].hls.subtitle_index == 3
+        assert fake.opened[-1][0] == "/Items/hls-1/PlaybackInfo"
+
+
 def test_reported_token_never_appears_in_a_room_state(monkeypatch):
     with _client(monkeypatch) as client:
         _fake(client)
