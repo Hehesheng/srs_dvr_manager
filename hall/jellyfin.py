@@ -272,6 +272,68 @@ def item_name(item: Dict[str, Any]) -> str:
     return name or "Jellyfin 视频"
 
 
+# Everything the browser sends back: enough to render a folder row, label an
+# episode (S01E05) and decide whether it can be played directly.
+BROWSE_FIELDS = (
+    "MediaSources,RunTimeTicks,ChildCount,RecursiveItemCount,"
+    "SeriesId,SeriesName,IndexNumber,ParentIndexNumber"
+)
+
+# Anything shorter is an episode or a clip, not a film: 40 minutes.
+FEATURE_SECONDS = 2400.0
+
+KIND_BY_TYPE = {
+    "Series": "series",
+    "Season": "season",
+    "Folder": "folder",
+    "BoxSet": "folder",
+    "CollectionFolder": "folder",
+    "Movie": "movie",
+    "Episode": "episode",
+    "Video": "video",
+    "MusicVideo": "video",
+}
+
+
+def item_kind(item: Dict[str, Any]) -> str:
+    """A small, stable vocabulary for the browser, whatever Jellyfin calls it."""
+    return KIND_BY_TYPE.get(str(item.get("Type") or ""), "item")
+
+
+def browse_name(item: Dict[str, Any], kind: str) -> str:
+    """The title to show in the picker.
+
+    ``ProductionYear`` helps tell two films apart, but Jellyfin also stamps a
+    guessed year on every episode file, and libraries that store episodes as
+    loose movies then read "第 3 集 (1991) (2013)…".  Only keep the year for
+    things long enough to be an actual film.
+    """
+    if kind in ("episode", "video") or duration_seconds(item) < FEATURE_SECONDS:
+        return str(item.get("Name") or "").strip() or "Jellyfin 视频"
+    return item_name(item)
+
+
+def item_child_count(item: Dict[str, Any], kind: str) -> int:
+    """How many things live under a folder row.
+
+    A series reports one child (its season) but 23 recursive items, and the
+    host cares about the 23 episodes, so prefer the recursive count there.
+    """
+    if kind in ("series", "season"):
+        keys = ("RecursiveItemCount", "ChildCount")
+    else:
+        keys = ("ChildCount", "RecursiveItemCount")
+    for key in keys:
+        value = item.get(key)
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return 0
+
+
 class JellyfinClient:
     def __init__(self, session: aiohttp.ClientSession, base_url: str, max_bitrate: int) -> None:
         self.session = session
@@ -428,39 +490,86 @@ class JellyfinClient:
         query: str = "",
         start: int = 0,
         limit: int = 60,
+        mode: str = "children",
     ) -> Dict[str, Any]:
+        """List one level of the library, or the episodes of a series.
+
+        ``children`` walks down the folder tree one step at a time, which is
+        what keeps a folder's episodes together instead of interleaving them
+        with everything else in the library.  ``episodes`` flattens a series
+        so the host does not have to click through "Season 1" first.
+        """
+        wanted = mode if mode in ("children", "episodes") else "children"
         params: Dict[str, Any] = {
-            "Recursive": "true",
-            "IncludeItemTypes": "Movie,Episode,Video,MusicVideo",
-            "Fields": "MediaSources,RunTimeTicks",
-            "SortBy": "SortName",
+            "Fields": BROWSE_FIELDS,
             "SortOrder": "Ascending",
             "StartIndex": max(0, int(start)),
             "Limit": min(200, max(1, int(limit))),
             "ImageTypeLimit": 0,
             "EnableImages": "false",
         }
+        if wanted == "episodes":
+            params["Recursive"] = "true"
+            # Episode covers a real series; Movie covers the many anime
+            # folders whose "episodes" Jellyfin labelled as loose movies.
+            params["IncludeItemTypes"] = "Episode,Movie,Video,MusicVideo"
+            params["SortBy"] = "ParentIndexNumber,IndexNumber,SortName"
+        else:
+            params["Recursive"] = "false"
+            # Folders sort first so the tree stays readable: series and
+            # folders on top, loose movies underneath.
+            params["SortBy"] = "IsFolder,SortName"
         if parent_id:
             params["ParentId"] = parent_id
-        if query.strip():
-            params["SearchTerm"] = query.strip()[:64]
+        text = query.strip()[:64]
+        if text:
+            # A search reaches into the current folder, and offers the folders
+            # themselves so a hit can be opened instead of flattened.
+            params["SearchTerm"] = text
             params["Recursive"] = "true"
+            params["SortBy"] = "IsFolder,SortName"
+            params["IncludeItemTypes"] = "Movie,Series,Folder,BoxSet,Episode,Video,MusicVideo"
         payload = await self._json(
             "GET", f"/Users/{session.user_id}/Items", session, params=params
-        )
-        return self._project_items(payload or {})
+        ) or {}
+        if text:
+            # Jellyfin ignores IsFolder in a search, but the thing the host
+            # searched for is usually the series — put it above its episodes.
+            items = payload.get("Items") or []
+            payload = {
+                **payload,
+                "Items": sorted(
+                    items,
+                    key=lambda entry: (
+                        0 if entry.get("IsFolder") else 1,
+                        str(entry.get("SortName") or entry.get("Name") or ""),
+                    ),
+                ),
+            }
+        return self._project_items(payload)
 
     def _project_items(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         items = []
         for item in payload.get("Items") or []:
             sources = item.get("MediaSources") or []
             source = sources[0] if sources else {}
-            mode = playback_mode(source) if source else "hls"
+            folder = bool(item.get("IsFolder"))
+            kind = item_kind(item)
+            # Containers have no file of their own; leaving mode as "hls"
+            # would make the browser offer to play a series.
+            mode = None if folder or not source else playback_mode(source)
             items.append(
                 {
                     "id": str(item.get("Id") or ""),
-                    "name": item_name(item),
+                    "name": browse_name(item, kind),
                     "type": str(item.get("Type") or ""),
+                    "kind": kind,
+                    "is_folder": folder,
+                    "child_count": item_child_count(item, kind),
+                    "series_id": str(item.get("SeriesId") or ""),
+                    "series_name": str(item.get("SeriesName") or ""),
+                    "season": item.get("ParentIndexNumber"),
+                    "episode": item.get("IndexNumber"),
                     "mode": mode,
                     "duration": round(duration_seconds(item), 3),
                     "bitrate": int(source.get("Bitrate") or 0),

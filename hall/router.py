@@ -290,10 +290,12 @@ async def jellyfin_session(
 async def jellyfin_items(
     room_ref: str,
     request: Request,
+    parent: Optional[str] = Query(default=None),
     library: Optional[str] = Query(default=None),
     q: str = Query(default=""),
     start: int = Query(default=0),
     limit: int = Query(default=60),
+    mode: str = Query(default="children"),
     x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
 ):
     hall = _hall(request)
@@ -303,7 +305,11 @@ async def jellyfin_items(
     if room is None:
         return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
     try:
-        return await hall.jellyfin_items(room, x_host_token or "", library, q, start, limit)
+        # `parent` is the folder being browsed; `library` is the older name for
+        # the same thing and still comes from cached browser pages.
+        return await hall.jellyfin_items(
+            room, x_host_token or "", parent or library, q, start, limit, mode
+        )
     except HallError as exc:
         return _hall_error(exc)
 

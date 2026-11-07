@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import pytest
@@ -54,6 +55,7 @@ class FakeJellyfinClient(JellyfinClient):
         self.opened = []
         self.profiles = []
         self.subtitle_calls = []
+        self.item_calls = []
 
     async def _json(self, method, path, session=None, *, params=None, body=None, timeout=20.0):
         if method == "POST" and path.endswith("/PlaybackInfo"):
@@ -103,13 +105,24 @@ class FakeJellyfinClient(JellyfinClient):
     async def libraries(self, session):
         return [{"id": "lib-1", "name": "电影", "collection_type": "movies"}]
 
-    async def items(self, session, parent_id=None, query="", start=0, limit=60):
+    async def items(self, session, parent_id=None, query="", start=0, limit=60, mode="children"):
+        self.item_calls.append(
+            {
+                "parent_id": parent_id,
+                "query": query,
+                "start": start,
+                "limit": limit,
+                "mode": mode,
+            }
+        )
         return {
             "items": [
                 {
                     "id": "direct-1",
                     "name": "直接播放 (2024)",
                     "type": "Movie",
+                    "kind": "movie",
+                    "is_folder": False,
                     "mode": "direct",
                     "duration": 120.0,
                     "bitrate": 900_000,
@@ -119,6 +132,8 @@ class FakeJellyfinClient(JellyfinClient):
                     "id": "hls-1",
                     "name": "需要转码 (2021)",
                     "type": "Movie",
+                    "kind": "movie",
+                    "is_folder": False,
                     "mode": "hls",
                     "duration": 3600.0,
                     "bitrate": 15_000_000,
@@ -562,6 +577,249 @@ def test_jellyfin_browse_requires_a_session(monkeypatch):
         assert listing.status_code == 200
         body = listing.json()
         assert [item["mode"] for item in body["items"]] == ["direct", "hls"]
+
+
+def _project(payload):
+    client = JellyfinClient(None, "http://jelly.invalid", 1)
+    return client._project_items(payload)
+
+
+def test_projecting_a_folder_offers_navigation_not_playback():
+    body = _project(
+        {
+            "Items": [
+                {
+                    "Id": "f1",
+                    "Name": "埃罗芒阿老师1080p片源",
+                    "Type": "Folder",
+                    "IsFolder": True,
+                    "ChildCount": 12,
+                    "RecursiveItemCount": 12,
+                }
+            ],
+            "TotalRecordCount": 1,
+        }
+    )
+    item = body["items"][0]
+    assert item["is_folder"] is True
+    assert item["kind"] == "folder"
+    assert item["child_count"] == 12
+    # A folder has no file of its own, so it must not look playable.
+    assert item["mode"] is None
+
+
+def test_projecting_a_series_counts_episodes_not_seasons():
+    body = _project(
+        {
+            "Items": [
+                {
+                    "Id": "s1",
+                    "Name": "86-不存在的战区-",
+                    "Type": "Series",
+                    "IsFolder": True,
+                    "ChildCount": 1,
+                    "RecursiveItemCount": 23,
+                }
+            ],
+            "TotalRecordCount": 1,
+        }
+    )
+    item = body["items"][0]
+    assert item["kind"] == "series"
+    assert item["child_count"] == 23
+    assert item["mode"] is None
+
+
+def test_projecting_an_episode_carries_its_series_and_numbers():
+    body = _project(
+        {
+            "Items": [
+                {
+                    "Id": "e1",
+                    "Name": "张超强闯地铁站",
+                    "Type": "Episode",
+                    "IsFolder": False,
+                    "SeriesId": "s1",
+                    "SeriesName": "沉默的真相",
+                    "ParentIndexNumber": 2,
+                    "IndexNumber": 5,
+                    "RunTimeTicks": 600 * 10_000_000,
+                    "MediaSources": [
+                        {
+                            "Container": "mkv",
+                            "MediaStreams": [
+                                {"Type": "Video", "Codec": "hevc"},
+                                {"Type": "Audio", "Codec": "aac"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "TotalRecordCount": 1,
+        }
+    )
+    item = body["items"][0]
+    assert item["kind"] == "episode"
+    assert item["is_folder"] is False
+    # A scraper-guessed year on every episode only makes the list noisy.
+    assert item["name"] == "张超强闯地铁站"
+    assert item["series_id"] == "s1"
+    assert item["series_name"] == "沉默的真相"
+    assert (item["season"], item["episode"]) == (2, 5)
+    assert item["mode"] == "hls"
+
+
+def test_projecting_a_plain_movie_stays_playable():
+    body = _project(
+        {
+            "Items": [
+                {
+                    "Id": "m1",
+                    "Name": "楚门的世界",
+                    "Type": "Movie",
+                    "IsFolder": False,
+                    "MediaSources": [
+                        {
+                            "Container": "mp4",
+                            "MediaStreams": [
+                                {"Type": "Video", "Codec": "h264"},
+                                {"Type": "Audio", "Codec": "aac"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "TotalRecordCount": 1,
+        }
+    )
+    item = body["items"][0]
+    assert item["kind"] == "movie"
+    assert item["mode"] == "direct"
+    assert item["child_count"] == 0
+
+
+def test_a_short_file_does_not_advertise_a_guessed_year():
+    payload = {
+        "Items": [
+            {
+                "Id": "m2",
+                "Name": "埃罗芒阿老师 03",
+                "Type": "Movie",
+                "ProductionYear": 2013,
+                "RunTimeTicks": 23 * 60 * 10_000_000,
+                "MediaSources": [
+                    {
+                        "Container": "mp4",
+                        "MediaStreams": [
+                            {"Type": "Video", "Codec": "h264"},
+                            {"Type": "Audio", "Codec": "aac"},
+                        ],
+                    }
+                ],
+            },
+            {
+                "Id": "m3",
+                "Name": "楚门的世界",
+                "Type": "Movie",
+                "ProductionYear": 1998,
+                "RunTimeTicks": 103 * 60 * 10_000_000,
+                "MediaSources": [],
+            },
+        ],
+        "TotalRecordCount": 2,
+    }
+    short, film = _project(payload)["items"]
+    assert short["name"] == "埃罗芒阿老师 03"
+    assert film["name"] == "楚门的世界 (1998)"
+
+
+def _recording_client(payload=None):
+    """A client whose HTTP layer is captured instead of sent."""
+    client = JellyfinClient(None, "http://jelly.invalid", 1)
+    calls = []
+
+    async def fake_json(method, path, session=None, *, params=None, body=None, timeout=20.0):
+        calls.append(params or {})
+        return payload if payload is not None else {"Items": [], "TotalRecordCount": 0}
+
+    client._json = fake_json
+    session = JellyfinSession(token="t", user_id="u", user_name="n", device_id="d")
+    return client, session, calls
+
+
+def test_children_mode_lists_one_folder_without_a_type_filter():
+    client, session, calls = _recording_client()
+    asyncio.run(client.items(session, "lib-1"))
+    params = calls[-1]
+    assert params["Recursive"] == "false"
+    assert params["ParentId"] == "lib-1"
+    assert params["SortBy"] == "IsFolder,SortName"
+    # A user root answers with UserView/CollectionFolder, so a type filter
+    # here would empty the list.
+    assert "IncludeItemTypes" not in params
+    assert "ChildCount" in params["Fields"]
+
+
+def test_episodes_mode_flattens_a_series_and_keeps_loose_movies():
+    client, session, calls = _recording_client()
+    asyncio.run(client.items(session, "series-1", mode="episodes"))
+    params = calls[-1]
+    assert params["Recursive"] == "true"
+    assert params["SortBy"].startswith("ParentIndexNumber")
+    types = params["IncludeItemTypes"].split(",")
+    assert "Episode" in types and "Movie" in types
+
+
+def test_search_is_recursive_offers_folders_and_puts_them_first():
+    payload = {
+        "Items": [
+            {"Id": "m1", "Name": "埃罗芒阿老师 01", "Type": "Movie", "IsFolder": False},
+            {"Id": "f1", "Name": "埃罗芒阿老师1080p片源", "Type": "Folder", "IsFolder": True},
+        ],
+        "TotalRecordCount": 2,
+    }
+    client, session, calls = _recording_client(payload)
+    body = asyncio.run(client.items(session, "lib-1", query="埃罗芒阿"))
+    params = calls[-1]
+    assert params["Recursive"] == "true"
+    assert params["SearchTerm"] == "埃罗芒阿"
+    assert "Folder" in params["IncludeItemTypes"].split(",")
+    assert [item["id"] for item in body["items"]] == ["f1", "m1"]
+
+
+def test_browse_mode_reaches_the_client_intact(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        url = f"/hall/api/rooms/{room['room_code']}/jellyfin/items"
+        headers = {"X-Host-Token": room["host_token"]}
+
+        assert client.get(url, headers=headers).status_code == 200
+        assert fake.item_calls[-1]["mode"] == "children"
+
+        assert client.get(f"{url}?mode=episodes&library=s1", headers=headers).status_code == 200
+        assert fake.item_calls[-1]["mode"] == "episodes"
+        assert fake.item_calls[-1]["parent_id"] == "s1"
+
+        # Anything else falls back to walking the tree.
+        assert client.get(f"{url}?mode=nonsense", headers=headers).status_code == 200
+        assert fake.item_calls[-1]["mode"] == "children"
+
+
+def test_adding_a_whole_series_is_rejected_clearly(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+
+        async def container_item(session, item_id):
+            return {"Id": item_id, "Name": "沉默的真相", "Type": "Series", "IsFolder": True}
+
+        monkeypatch.setattr(fake, "item", container_item)
+        response = _item(client, room, "series-1")
+        assert response.status_code == 400
+        assert "剧集" in response.json()["message"]
 
 
 def test_jellyfin_library_is_visible_only_to_the_host(monkeypatch):

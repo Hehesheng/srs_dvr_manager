@@ -22,6 +22,7 @@ from .jellyfin import (
     JellyfinSource,
     direct_mime,
     duration_seconds,
+    item_kind,
     item_name,
     playback_mode,
     subtitle_streams,
@@ -416,6 +417,14 @@ class HallManager:
         except JellyfinError as exc:
             raise HallError(exc.message, exc.code, exc.status_code)
 
+        if item_kind(item) in ("series", "season", "folder"):
+            # A container has no file of its own; say so instead of letting it
+            # fall through to "这个条目没有可播放的文件".
+            raise HallError(
+                "请选择具体某一集或影片，而不是整个剧集/文件夹",
+                protocol.ERR_BAD_MESSAGE,
+                400,
+            )
         sources = item.get("MediaSources") or []
         if not sources:
             raise HallError("这个条目没有可播放的文件", "MEDIA_NOT_FOUND", 404)
@@ -423,15 +432,10 @@ class HallManager:
         mode = playback_mode(source)
         duration = duration_seconds(item)
         name = item_name(item)
-        room.jellyfin_item = source
-        room.jellyfin_subtitle_tracks = subtitle_streams(source)
-        room.jellyfin_subtitle = None
-        room.jellyfin_subtitles_off = False
 
         if mode == "direct":
             # Direct play gets real WebVTT tracks; there is no transcode to burn
             # subtitles into, so the picker has nothing to choose.
-            room.jellyfin_subtitle_tracks = []
             try:
                 size = await self.jellyfin.probe_size(room.jellyfin, item_id)
             except JellyfinError as exc:
@@ -454,6 +458,7 @@ class HallManager:
                 jellyfin_source=JellyfinSource(
                     self.jellyfin, room.jellyfin, item_id, size, mime
                 ),
+                jellyfin_item=source,
             )
 
         try:
