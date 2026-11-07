@@ -17,7 +17,8 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from uuid import uuid4
 
 import aiohttp
 
@@ -90,6 +91,10 @@ class HlsSession:
     live_url: str
     start_seconds: float
     epoch: int = 0
+    # Which subtitle track Jellyfin is burning into this stream; None means
+    # "whatever the account default picks" and ``subtitles_off`` means none.
+    subtitle_index: Optional[int] = None
+    subtitles_off: bool = False
     target_duration: float = 3.0
     segments: Dict[int, str] = field(default_factory=dict)
     durations: Dict[int, float] = field(default_factory=dict)
@@ -185,6 +190,70 @@ def text_subtitle_streams(media_source: Dict[str, Any]) -> List[Dict[str, Any]]:
         and str(stream.get("Codec") or "").lower() in TEXT_SUBTITLE_CODECS
         and stream.get("Index") is not None
     ]
+
+
+LANGUAGE_NAMES = {
+    "zh": "简体中文",
+    "chi": "简体中文",
+    "zho": "中文",
+    "zh-cn": "简体中文",
+    "zh-hans": "简体中文",
+    "zh-tw": "繁體中文",
+    "zh-hant": "繁體中文",
+    "eng": "英语",
+    "en": "英语",
+    "jpn": "日语",
+    "ja": "日语",
+    "kor": "韩语",
+    "ko": "韩语",
+    "und": "字幕",
+}
+
+
+def subtitle_label(stream: Dict[str, Any], language: str = "") -> str:
+    """``简体中文 - Chi - 默认 - ASS`` becomes ``简体中文（默认）``."""
+    raw = str(stream.get("DisplayTitle") or stream.get("Title") or "").strip()
+    parts = [part.strip() for part in re.split(r"\s+-\s+", raw) if part.strip()] if raw else []
+    lang = (language or str(stream.get("Language") or "")).strip().lower()
+    base = parts[0] if parts else ""
+    if not base:
+        base = LANGUAGE_NAMES.get(lang, language or "字幕")
+    flags = {part.lower() for part in parts[1:]}
+    marks: List[str] = []
+    default = bool(stream.get("IsDefault")) or bool(flags & {"默认", "default"})
+    if default:
+        marks.append("默认")
+    if flags & {"强制", "forced"}:
+        marks.append("强制")
+    label = f"{base}（{'、'.join(marks)}）" if marks else base
+    return label[:40]
+
+
+def subtitle_streams(media_source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every subtitle track, including image-based ones.
+
+    Burning subtitles into the transcode works for PGS/VOBSUB too, so unlike
+    ``text_subtitle_streams`` this list is not limited to text codecs.
+    """
+    tracks: List[Dict[str, Any]] = []
+    for stream in media_streams(media_source):
+        if stream.get("Type") != "Subtitle":
+            continue
+        try:
+            index = int(stream.get("Index"))
+        except (TypeError, ValueError):
+            continue
+        language = str(stream.get("Language") or "").strip()
+        tracks.append(
+            {
+                "index": index,
+                "label": subtitle_label(stream, language),
+                "language": language,
+                "codec": str(stream.get("Codec") or "").lower(),
+                "is_default": bool(stream.get("IsDefault")),
+            }
+        )
+    return tracks
 
 
 def duration_seconds(item: Dict[str, Any]) -> float:
@@ -466,7 +535,17 @@ class JellyfinClient:
             raise JellyfinError(f"连接 Jellyfin 失败: {exc}", "JELLYFIN_UNAVAILABLE", 502)
 
     # -- transcoding ---------------------------------------------------
-    def _device_profile(self) -> Dict[str, Any]:
+    def _device_profile(self, subtitles_off: bool = False) -> Dict[str, Any]:
+        # An empty SubtitleProfiles list says "this client cannot show any
+        # subtitle", which makes Jellyfin burn the account's default track into
+        # the picture.  Declaring text formats as external instead means no
+        # burn-in at all.
+        subtitle_profiles: List[Dict[str, Any]] = []
+        if subtitles_off:
+            subtitle_profiles = [
+                {"Format": codec, "Method": "External"}
+                for codec in ("srt", "subrip", "ass", "ssa", "vtt", "webvtt")
+            ]
         return {
             "MaxStreamingBitrate": self.max_bitrate,
             "DirectPlayProfiles": [
@@ -491,7 +570,7 @@ class JellyfinClient:
                 }
             ],
             "CodecProfiles": [],
-            "SubtitleProfiles": [],
+            "SubtitleProfiles": subtitle_profiles,
         }
 
     async def open_transcode(
@@ -500,15 +579,24 @@ class JellyfinClient:
         item_id: str,
         start_seconds: float,
         epoch: int,
+        subtitle_index: Optional[int] = None,
+        subtitles_off: bool = False,
     ) -> HlsSession:
-        """Start (or restart) a transcoding session at ``start_seconds``."""
+        """Start (or restart) a transcoding session at ``start_seconds``.
+
+        ``PlaybackInfo``'s own ``SubtitleStreamIndex`` is ignored by Jellyfin
+        (it always answers with the account default), so the track is chosen
+        by rewriting the query of the returned ``TranscodingUrl`` instead --
+        together with a fresh ``PlaySessionId``, without which Jellyfin keeps
+        serving the previous session's segments.
+        """
         body = {
             "UserId": session.user_id,
             "StartTimeTicks": int(max(0.0, start_seconds) * 10_000_000),
             "IsPlayback": True,
             "AutoOpenLiveStream": True,
             "MaxStreamingBitrate": self.max_bitrate,
-            "DeviceProfile": self._device_profile(),
+            "DeviceProfile": self._device_profile(subtitles_off),
         }
         payload = await self._json(
             "POST",
@@ -525,10 +613,13 @@ class JellyfinClient:
         transcoding_url = str(source.get("TranscodingUrl") or "")
         if not transcoding_url:
             raise JellyfinError("Jellyfin 没有给出转码地址", "JELLYFIN_TRANSCODE_FAILED")
+        transcoding_url, rewritten_session_id = self._rewrite_transcode_subtitles(
+            transcoding_url, subtitle_index, subtitles_off
+        )
         master_url = self.absolute(transcoding_url)
         live_url = await self._resolve_live_url(session, master_url)
 
-        play_session_id = str(
+        play_session_id = rewritten_session_id or str(
             source.get("PlaySessionId") or (payload or {}).get("PlaySessionId") or ""
         )
         return HlsSession(
@@ -538,7 +629,56 @@ class JellyfinClient:
             live_url=live_url,
             start_seconds=max(0.0, float(start_seconds)),
             epoch=epoch,
+            subtitle_index=subtitle_index,
+            subtitles_off=subtitles_off,
         )
+
+    @staticmethod
+    def _rewrite_transcode_subtitles(
+        transcoding_url: str, subtitle_index: Optional[int], subtitles_off: bool
+    ) -> Tuple[str, Optional[str]]:
+        """Point the transcode at ``subtitle_index`` (or at no subtitle at all).
+
+        Returns the rewritten URL and the new ``PlaySessionId``, or the URL
+        unchanged and ``None`` when nothing needs to change.
+        """
+        # Jellyfin spells these SubtitleStreamIndex / SubtitleMethod /
+        # PlaySessionId; match them whatever case it sends.
+        index_key = "subtitlestreamindex"
+        method_key = "subtitlemethod"
+        session_key = "playsessionid"
+
+        parsed = urlparse(transcoding_url)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        lower = {key.lower() for key, _ in pairs}
+        has_subtitle = index_key in lower or method_key in lower
+
+        if subtitle_index is not None:
+            wanted = {index_key: str(int(subtitle_index)), method_key: "Encode"}
+        elif subtitles_off and has_subtitle:
+            wanted = {index_key: None, method_key: None}
+        else:
+            return transcoding_url, None
+
+        new_session_id = uuid4().hex
+        kept: List[Tuple[str, str]] = []
+        for key, value in pairs:
+            low = key.lower()
+            if low in (index_key, method_key):
+                if wanted.get(low) is not None:
+                    kept.append((key, str(wanted[low])))
+                continue
+            if low == session_key:
+                kept.append((key, new_session_id))
+                continue
+            kept.append((key, value))
+        if wanted.get(index_key) is not None and index_key not in lower:
+            kept.append(("SubtitleStreamIndex", str(wanted[index_key])))
+        if wanted.get(method_key) is not None and method_key not in lower:
+            kept.append(("SubtitleMethod", str(wanted[method_key])))
+        if session_key not in lower:
+            kept.append(("PlaySessionId", new_session_id))
+        return urlunparse(parsed._replace(query=urlencode(kept, doseq=True))), new_session_id
 
     async def _resolve_live_url(self, session: JellyfinSession, master_url: str) -> str:
         text = await self._json("GET", self._with_token(master_url, session), session, timeout=25.0)

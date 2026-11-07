@@ -24,6 +24,7 @@ from .jellyfin import (
     duration_seconds,
     item_name,
     playback_mode,
+    subtitle_streams,
     text_subtitle_streams,
 )
 from .rooms import MediaInfo, Member, Room
@@ -423,8 +424,14 @@ class HallManager:
         duration = duration_seconds(item)
         name = item_name(item)
         room.jellyfin_item = source
+        room.jellyfin_subtitle_tracks = subtitle_streams(source)
+        room.jellyfin_subtitle = None
+        room.jellyfin_subtitles_off = False
 
         if mode == "direct":
+            # Direct play gets real WebVTT tracks; there is no transcode to burn
+            # subtitles into, so the picker has nothing to choose.
+            room.jellyfin_subtitle_tracks = []
             try:
                 size = await self.jellyfin.probe_size(room.jellyfin, item_id)
             except JellyfinError as exc:
@@ -621,6 +628,62 @@ class HallManager:
             task = asyncio.create_task(self._run_seek(room))
             self._seek_tasks[room.room_id] = task
 
+    async def set_transcode_subtitle(
+        self,
+        room: Room,
+        host_token: str,
+        choice: Optional[Any],
+        position: float,
+    ) -> None:
+        """Pick the subtitle burned into the room's transcode.
+
+        ``None`` follows Jellyfin's account default, ``"off"`` asks for no
+        subtitle at all, and an ``int`` picks that stream index.  Every change
+        restarts the transcode, so it goes through the same debounced path as
+        a seek and publishes a new epoch.
+        """
+        self._require_host(room, host_token)
+        if room.media is None or room.media.playback_mode != "hls" or room.hls is None:
+            raise HallError("当前播放项不需要转码", protocol.ERR_BAD_MESSAGE, 400)
+        if room.jellyfin is None:
+            raise HallError(
+                "Jellyfin 登录已失效，请重新登录",
+                protocol.ERR_JELLYFIN_AUTH_REQUIRED,
+                401,
+            )
+        if choice is None:
+            index: Optional[int] = None
+            off = False
+        elif isinstance(choice, str) and choice == "off":
+            index = None
+            off = True
+        elif isinstance(choice, int) and not isinstance(choice, bool) and choice >= 0:
+            index = int(choice)
+            off = False
+        else:
+            raise HallError("字幕选择不正确", protocol.ERR_BAD_MESSAGE, 400)
+        if index is not None:
+            known = {
+                int(track["index"])
+                for track in room.jellyfin_subtitle_tracks
+                if isinstance(track.get("index"), int)
+            }
+            if known and index not in known:
+                raise HallError("没有这条字幕轨", protocol.ERR_BAD_MESSAGE, 400)
+        if (
+            index == room.jellyfin_subtitle
+            and off == room.jellyfin_subtitles_off
+            and room.hls is not None
+        ):
+            return
+        room.jellyfin_subtitle = index
+        room.jellyfin_subtitles_off = off
+        room.pending_seek = max(0.0, float(position))
+        task = self._seek_tasks.get(room.room_id)
+        if task is None or task.done():
+            task = asyncio.create_task(self._run_seek(room))
+            self._seek_tasks[room.room_id] = task
+
     async def _run_seek(self, room: Room) -> None:
         delay = self.config.jellyfin.seek_debounce_ms / 1000.0
         try:
@@ -648,7 +711,12 @@ class HallManager:
             return
         try:
             fresh = await client.open_transcode(
-                session, old.item_id, position, old.epoch + 1
+                session,
+                old.item_id,
+                position,
+                old.epoch + 1,
+                subtitle_index=room.jellyfin_subtitle,
+                subtitles_off=room.jellyfin_subtitles_off,
             )
         except JellyfinAuthError:
             room.jellyfin = None
@@ -723,7 +791,11 @@ class HallManager:
         """Pull the item's text subtitle tracks in the background."""
         if media.kind != "jellyfin" or self.jellyfin is None or room.jellyfin is None:
             return
-        source = room.jellyfin_media_source or {}
+        if media.playback_mode != "direct":
+            # A transcoded item has its subtitle burned into the picture by
+            # Jellyfin; loading a WebVTT track as well would double it up.
+            return
+        source = room.jellyfin_item or {}
         tracks = text_subtitle_streams(source)
         if not tracks:
             return
@@ -737,7 +809,7 @@ class HallManager:
         session = room.jellyfin
         if session is None or self.jellyfin is None:
             return
-        source_id = str((room.jellyfin_media_source or {}).get("Id") or media.item_id or "")
+        source_id = str((room.jellyfin_item or {}).get("Id") or media.item_id or "")
         for track in tracks:
             if room.ended or room.media is None or room.media.media_id != media.media_id:
                 return

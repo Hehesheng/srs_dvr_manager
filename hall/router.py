@@ -1,7 +1,7 @@
 """HTTP and WebSocket routes for the media hall."""
 
 import logging
-from typing import Optional
+from typing import Any, Optional, Union
 
 from fastapi import APIRouter, Header, Query, Request, WebSocket, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -47,6 +47,12 @@ class JellyfinLoginRequest(BaseModel):
 
 
 class HlsSeekRequest(BaseModel):
+    position: float = 0.0
+
+
+class HlsSubtitleRequest(BaseModel):
+    # A stream index, "off", or null to follow Jellyfin's default track.
+    subtitle: Optional[Union[int, str]] = None
     position: float = 0.0
 
 
@@ -343,6 +349,42 @@ async def hls_seek(
     except HallError as exc:
         return _hall_error(exc)
     return {"code": 0, "position": round(payload.position, 3)}
+
+
+@router.post("/api/rooms/{room_ref}/hls/subtitle")
+async def hls_subtitle(
+    room_ref: str,
+    payload: HlsSubtitleRequest,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    """Choose the subtitle burned into the room's transcode.
+
+    The pick restarts the transcode at ``position``, so every client's
+    ``media_epoch`` moves with it -- members follow without doing anything.
+    """
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    choice: Any = payload.subtitle
+    if isinstance(choice, str):
+        text = choice.strip().lower()
+        if text.isdigit():
+            choice = int(text)
+        else:
+            choice = text or None
+    try:
+        await hall.set_transcode_subtitle(room, x_host_token or "", choice, payload.position)
+    except HallError as exc:
+        return _hall_error(exc)
+    return {
+        "code": 0,
+        "subtitle": room.jellyfin_subtitle,
+        "subtitles_off": room.jellyfin_subtitles_off,
+    }
 
 
 @router.get("/api/rooms/{room_ref}")

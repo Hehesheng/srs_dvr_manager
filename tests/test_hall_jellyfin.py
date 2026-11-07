@@ -11,6 +11,7 @@ from hall.jellyfin import (
     JellyfinSession,
     clean_vtt,
     playback_mode,
+    subtitle_streams,
 )
 from hall.manager import HallConfig, HallManager, JellyfinConfig
 
@@ -51,10 +52,13 @@ class FakeJellyfinClient(JellyfinClient):
         self.playlist_calls = 0
         self.stopped = []
         self.opened = []
+        self.profiles = []
+        self.subtitle_calls = []
 
     async def _json(self, method, path, session=None, *, params=None, body=None, timeout=20.0):
         if method == "POST" and path.endswith("/PlaybackInfo"):
             self.opened.append((path, (body or {}).get("StartTimeTicks")))
+            self.profiles.append((body or {}).get("DeviceProfile") or {})
             index = len(self.opened)
             return {
                 "MediaSources": [
@@ -137,6 +141,13 @@ class FakeJellyfinClient(JellyfinClient):
                         "MediaStreams": [
                             {"Type": "Video", "Codec": "h264"},
                             {"Type": "Audio", "Codec": "aac"},
+                            {
+                                "Type": "Subtitle",
+                                "Index": 1,
+                                "Codec": "subrip",
+                                "Language": "eng",
+                                "DisplayTitle": "英语 - Eng - ASS",
+                            },
                         ],
                     }
                 ],
@@ -153,6 +164,28 @@ class FakeJellyfinClient(JellyfinClient):
                         "MediaStreams": [
                             {"Type": "Video", "Codec": "hevc"},
                             {"Type": "Audio", "Codec": "flac"},
+                            {
+                                "Type": "Subtitle",
+                                "Index": 2,
+                                "Codec": "ass",
+                                "Language": "chi",
+                                "DisplayTitle": "简体中文 - Chi - 默认 - ASS",
+                                "IsDefault": True,
+                            },
+                            {
+                                "Type": "Subtitle",
+                                "Index": 3,
+                                "Codec": "ass",
+                                "Language": "zh-TW",
+                                "DisplayTitle": "繁體中文 - Chi - ASS",
+                            },
+                            {
+                                "Type": "Subtitle",
+                                "Index": 4,
+                                "Codec": "pgssub",
+                                "Language": "chi",
+                                "DisplayTitle": "图形字幕 - PGS",
+                            },
                         ],
                     }
                 ],
@@ -167,6 +200,10 @@ class FakeJellyfinClient(JellyfinClient):
 
     async def read_segment(self, session, hls, index):
         return b"SEG" + bytes([index]) * 16
+
+    async def subtitle_vtt(self, session, item_id, media_source_id, index):
+        self.subtitle_calls.append((item_id, index))
+        return "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n你好\n"
 
 
 def _client(monkeypatch):
@@ -269,6 +306,75 @@ def test_playback_mode_splits_between_direct_and_transcode():
         ],
     }
     assert playback_mode(flac) == "hls"
+
+
+def test_subtitle_streams_lists_image_tracks_and_cleans_their_labels():
+    """Burned-in subtitles can come from PGS too, so no codec filter here."""
+    source = {
+        "MediaStreams": [
+            {"Type": "Video", "Codec": "hevc"},
+            {
+                "Type": "Subtitle",
+                "Index": 2,
+                "Codec": "ass",
+                "Language": "chi",
+                "DisplayTitle": "简体中文 - Chi - 默认 - ASS",
+                "IsDefault": True,
+            },
+            {
+                "Type": "Subtitle",
+                "Index": 4,
+                "Codec": "pgssub",
+                "Language": "chi",
+                "DisplayTitle": "图形字幕 - PGS",
+            },
+        ]
+    }
+    tracks = subtitle_streams(source)
+    assert [track["index"] for track in tracks] == [2, 4]
+    assert tracks[0]["label"] == "简体中文（默认）"
+    assert tracks[0]["is_default"] is True
+    # The codec tail is dropped, and a PGS track is still offered: it can be
+    # burned in even though it can never become a WebVTT track.
+    assert tracks[1]["label"] == "图形字幕"
+    assert tracks[1]["codec"] == "pgssub"
+
+
+def test_burning_a_subtitle_rewrites_the_transcode_url_and_its_session():
+    url = (
+        "/videos/x/master.m3u8?DeviceId=d1&MediaSourceId=ms-1"
+        "&SubtitleStreamIndex=2&SubtitleMethod=Encode&PlaySessionId=old"
+    )
+    rewritten, session_id = JellyfinClient._rewrite_transcode_subtitles(url, 3, False)
+    assert "SubtitleStreamIndex=3" in rewritten
+    assert "SubtitleMethod=Encode" in rewritten
+    assert f"PlaySessionId={session_id}" in rewritten
+    assert session_id and session_id != "old"
+    assert "PlaySessionId=old" not in rewritten
+    # MediaSourceId and DeviceId must survive: Jellyfin needs both.
+    assert "MediaSourceId=ms-1" in rewritten
+    assert "DeviceId=d1" in rewritten
+
+
+def test_turning_subtitles_off_drops_the_burn_in_parameters():
+    url = "/videos/x/master.m3u8?DeviceId=d1&SubtitleStreamIndex=2&SubtitleMethod=Encode&PlaySessionId=old"
+    rewritten, session_id = JellyfinClient._rewrite_transcode_subtitles(url, None, True)
+    assert "SubtitleMethod" not in rewritten
+    assert "SubtitleStreamIndex" not in rewritten
+    assert f"PlaySessionId={session_id}" in rewritten
+    # Nothing to do when the URL never asked for a subtitle.
+    plain = "/videos/x/master.m3u8?DeviceId=d1&PlaySessionId=old"
+    assert JellyfinClient._rewrite_transcode_subtitles(plain, None, True) == (plain, None)
+
+
+def test_the_profile_that_turns_subtitles_off_asks_for_none_to_be_burned():
+    client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
+    # The default profile says "this client cannot show any subtitle", which
+    # is what makes Jellyfin draw the account's default track into the picture.
+    assert client._device_profile()["SubtitleProfiles"] == []
+    external = client._device_profile(subtitles_off=True)["SubtitleProfiles"]
+    assert external, "turning subtitles off must declare the text formats"
+    assert {profile["Method"] for profile in external} == {"External"}
 
 
 def test_playlist_lists_the_whole_movie_so_a_member_can_be_seeked_into_it():
@@ -650,6 +756,142 @@ def test_jellyfin_seek_is_host_only(monkeypatch):
             headers={"X-Host-Token": member["member_token"]},
         )
         assert denied.status_code == 403
+
+
+def _wait_epoch(client, room, wanted, timeout=5.0):
+    deadline = time.time() + timeout
+    info = None
+    while time.time() < deadline:
+        info = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        if info["media_epoch"] == wanted:
+            return info
+        time.sleep(0.05)
+    return info
+
+
+def test_host_picks_the_burned_in_subtitle_and_everyone_follows(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+
+        state = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        # The tracks are published so the host's CC menu can list them, even
+        # though a transcoded item never becomes a real WebVTT track.
+        assert [track["index"] for track in state["jellyfin_subtitles"]] == [2, 3, 4]
+        assert state["jellyfin_subtitle"] is None
+
+        pick = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/subtitle",
+            json={"subtitle": 3, "position": 600.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert pick.status_code == 200, pick.text
+        assert pick.json()["subtitle"] == 3
+
+        info = _wait_epoch(client, room, 2)
+        assert info["media_epoch"] == 2, "picking a subtitle must restart the transcode"
+        assert info["jellyfin_subtitle"] == 3
+        assert info["jellyfin_subtitles_off"] is False
+        assert info["media_start"] == 600.0
+        assert fake.opened[-1] == ("/Items/hls-1/PlaybackInfo", 600 * 10_000_000)
+        assert fake.stopped, "the previous transcoding session was left running"
+
+        session = _hall(client).rooms[room["room_id"]].hls
+        assert session.subtitle_index == 3
+        assert session.play_session_id not in ("", "ps-1")
+        # The chosen track has to survive a later seek.
+        seek = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/seek",
+            json={"position": 900.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert seek.status_code == 200
+        info = _wait_epoch(client, room, 3)
+        assert info["media_epoch"] == 3
+        assert _hall(client).rooms[room["room_id"]].hls.subtitle_index == 3
+
+
+def test_subtitles_can_be_turned_off_for_the_transcode(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+
+        off = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/subtitle",
+            json={"subtitle": "off", "position": 30.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert off.status_code == 200, off.text
+        info = _wait_epoch(client, room, 2)
+        assert info["media_epoch"] == 2
+        assert info["jellyfin_subtitles_off"] is True
+        assert info["jellyfin_subtitle"] is None
+        # Off means the profile declares the text formats as external, so
+        # there is nothing for ffmpeg to burn in.
+        profile = fake.profiles[-1]
+        assert {p["Method"] for p in profile["SubtitleProfiles"]} == {"External"}
+        assert _hall(client).rooms[room["room_id"]].hls.subtitles_off is True
+
+
+def test_subtitle_choice_is_host_only(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        member = client.post(
+            f"/hall/api/rooms/{room['room_code']}/join", json={"name": "bob"}
+        ).json()
+        denied = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/subtitle",
+            json={"subtitle": 3, "position": 10.0},
+            headers={"X-Host-Token": member["member_token"]},
+        )
+        assert denied.status_code == 403
+
+
+def test_an_unknown_subtitle_track_is_refused(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        bad = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/subtitle",
+            json={"subtitle": 99, "position": 10.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert bad.status_code == 400
+
+
+def test_a_direct_item_loads_vtt_tracks_but_a_transcoded_one_does_not(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "direct-1")
+
+        deadline = time.time() + 5
+        state = None
+        while time.time() < deadline:
+            state = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+            if state["subtitles"]:
+                break
+            time.sleep(0.05)
+        assert state["subtitles"], "direct play must load the item's text tracks"
+        assert fake.subtitle_calls == [("direct-1", 1)]
+        assert state["jellyfin_subtitles"] == []
+
+        # A transcoded item has its subtitle burned into the picture, so no
+        # WebVTT track is fetched (that would draw a second copy on top).
+        fake.subtitle_calls.clear()
+        _item(client, room, "hls-1")
+        time.sleep(0.3)
+        assert fake.subtitle_calls == []
 
 
 def test_reported_token_never_appears_in_a_room_state(monkeypatch):

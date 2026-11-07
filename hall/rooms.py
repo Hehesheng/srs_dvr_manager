@@ -128,7 +128,14 @@ class Room:
         self.jellyfin: Optional[Any] = None
         self.jellyfin_source: Optional[Any] = jellyfin_source
         self.hls: Optional[Any] = hls
-        self.jellyfin_media_source: Optional[Dict[str, Any]] = None
+        # The Jellyfin MediaSource of the current item: its MediaStreams hold
+        # the subtitle tracks this room can offer.
+        self.jellyfin_item: Optional[Dict[str, Any]] = None
+        self.jellyfin_subtitle_tracks: List[Dict[str, Any]] = []
+        # Which track the transcode burns in: an index, or None with
+        # ``jellyfin_subtitles_off`` set to ask Jellyfin for no subtitles.
+        self.jellyfin_subtitle: Optional[int] = None
+        self.jellyfin_subtitles_off: bool = False
         # Latest seek the host asked for while a restart was already running.
         self.pending_seek: float = 0.0
         self.members: Dict[str, Member] = {}
@@ -158,6 +165,13 @@ class Room:
         self.upstream = upstream
         self.jellyfin_source = jellyfin_source
         self.hls = hls
+        # Subtitle state describes one Jellyfin item; anything else drops it.
+        # (A Jellyfin build has just filled these in for the item it chose.)
+        if media.kind != "jellyfin":
+            self.jellyfin_item = None
+            self.jellyfin_subtitle_tracks = []
+            self.jellyfin_subtitle = None
+            self.jellyfin_subtitles_off = False
         self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         # In-flight host reads belong to the old media; failing them also makes
@@ -176,6 +190,10 @@ class Room:
         self.upstream = None
         self.jellyfin_source = None
         self.hls = None
+        self.jellyfin_item = None
+        self.jellyfin_subtitle_tracks = []
+        self.jellyfin_subtitle = None
+        self.jellyfin_subtitles_off = False
         self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         self.new_generation()
@@ -419,6 +437,9 @@ class Room:
             "active_subtitle_id": self.active_subtitle_id,
             "active_subtitle_visible": self.active_subtitle_visible,
             "jellyfin": self.jellyfin.public() if self.jellyfin else None,
+            "jellyfin_subtitles": self.jellyfin_subtitle_tracks,
+            "jellyfin_subtitle": self.jellyfin_subtitle,
+            "jellyfin_subtitles_off": self.jellyfin_subtitles_off,
             "ended": self.ended,
         }
 
@@ -453,6 +474,9 @@ class Room:
             "active_subtitle_id": self.active_subtitle_id,
             "active_subtitle_visible": self.active_subtitle_visible,
             "jellyfin": self.jellyfin.public() if self.jellyfin else None,
+            "jellyfin_subtitles": self.jellyfin_subtitle_tracks,
+            "jellyfin_subtitle": self.jellyfin_subtitle,
+            "jellyfin_subtitles_off": self.jellyfin_subtitles_off,
             "cache": {
                 "bytes": self.cache.bytes_used,
                 "hits": self.cache.hits,
