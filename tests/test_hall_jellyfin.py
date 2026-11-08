@@ -1,6 +1,8 @@
 import asyncio
+import threading
 import time
 
+import aiohttp
 import pytest
 from fastapi.testclient import TestClient
 
@@ -67,9 +69,18 @@ class FakeJellyfinClient(JellyfinClient):
         self.profiles = []
         self.subtitle_calls = []
         self.item_calls = []
+        # A test can hold a restart open to land a second seek while it runs.
+        self.hold_next = threading.Event()
+        self.held = threading.Event()
+        self.release = threading.Event()
 
     async def _json(self, method, path, session=None, *, params=None, body=None, timeout=20.0):
         if method == "POST" and path.endswith("/PlaybackInfo"):
+            if self.hold_next.is_set():
+                self.hold_next.clear()
+                self.held.set()
+                while not self.release.is_set():
+                    await asyncio.sleep(0.01)
             self.opened.append((path, (body or {}).get("StartTimeTicks")))
             self.profiles.append((body or {}).get("DeviceProfile") or {})
             index = len(self.opened)
@@ -660,6 +671,96 @@ def test_a_listed_segment_that_is_not_written_yet_is_waited_for():
     with pytest.raises(JellyfinError) as excinfo:
         asyncio.run(client.read_segment(session, hls, 9))
     assert excinfo.value.status_code == 404
+
+
+def test_a_segment_whose_connection_a_restart_killed_is_read_again():
+    """Stopping an encoder kills the response its segment was arriving on.
+
+    Every viewer mid-fetch when the host seeks would otherwise get a 502, which
+    the player answers by backing off and retrying -- a stall that outlives the
+    seek itself.
+    """
+
+    class Response:
+        def __init__(self, status, body=b""):
+            self.status = status
+            self._body = body
+
+        async def read(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class AbortingSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                raise aiohttp.ClientConnectionError("connection closed")
+            return Response(200, b"TS-DATA")
+
+    class RestartingEncoder:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                return Response(500)
+            return Response(200, b"TS-DATA")
+
+    client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
+    client.session = AbortingSession()
+    hls = HlsSession(
+        item_id="x",
+        media_source_id="ms-1",
+        play_session_id="ps-1",
+        live_url="http://jelly.invalid/videos/x/live.m3u8",
+        start_seconds=0.0,
+    )
+    session = JellyfinSession(token="t", user_id="u", user_name="n", device_id="d")
+    hls.segments = {0: "http://jelly.invalid/hls/abc/abc0.ts"}
+    assert asyncio.run(client.read_segment(session, hls, 0)) == b"TS-DATA"
+    assert client.session.calls == 3
+
+    # The encoder being replaced answers 5xx for a moment; same treatment.
+    client.session = RestartingEncoder()
+    assert asyncio.run(client.read_segment(session, hls, 0)) == b"TS-DATA"
+    assert client.session.calls == 3
+
+
+def test_a_connection_that_stays_broken_is_still_reported():
+    """Retrying a killed connection must not turn an outage into a hang."""
+
+    class AlwaysAborting:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            raise aiohttp.ClientConnectionError("connection closed")
+
+    client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
+    client.session = AlwaysAborting()
+    hls = HlsSession(
+        item_id="x",
+        media_source_id="ms-1",
+        play_session_id="ps-1",
+        live_url="http://jelly.invalid/videos/x/live.m3u8",
+        start_seconds=0.0,
+    )
+    session = JellyfinSession(token="t", user_id="u", user_name="n", device_id="d")
+    hls.segments = {0: "http://jelly.invalid/hls/abc/abc0.ts"}
+    with pytest.raises(JellyfinError) as excinfo:
+        asyncio.run(client.read_segment(session, hls, 0))
+    assert excinfo.value.code == "JELLYFIN_UNAVAILABLE"
+    assert client.session.calls == 5
 
 
 def test_clean_vtt_drops_ass_overrides_and_region_header():
@@ -1302,6 +1403,42 @@ def test_jellyfin_seek_restarts_the_transcode(monkeypatch):
         stale = client.get(old_url)
         assert stale.status_code == 409
         assert client.get(new_url).status_code == 200
+
+
+def test_jellyfin_seek_landing_during_a_restart_is_applied(monkeypatch):
+    """A drag is several seeks; the last one has to win.
+
+    Restarting a transcode takes seconds, so a seek that arrives while one is
+    running updates the pending position and nothing else.  Without going round
+    again the room stays on whichever position reached the transcoder first --
+    the host drags to the end and the picture comes back near the start.
+    """
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        seek_headers = {"X-Host-Token": room["host_token"]}
+        seek_url = f"/hall/api/rooms/{room['room_code']}/hls/seek"
+
+        fake.hold_next.set()
+        first = client.post(seek_url, json={"position": 100.0}, headers=seek_headers)
+        assert first.status_code == 200
+        assert fake.held.wait(5), "the restart never reached Jellyfin"
+
+        # The host is still dragging: this lands while the restart above runs.
+        second = client.post(seek_url, json={"position": 1800.0}, headers=seek_headers)
+        assert second.status_code == 200
+        fake.release.set()
+
+        info = _wait_epoch(client, room, 3, timeout=10)
+        assert info["media_epoch"] == 3, "the seek made during the restart was dropped"
+        assert info["media_resume"] == 1800.0
+        assert fake.opened[-1][1] == 1800 * 10_000_000
+        # Three opens: the first item, then one restart per position.  The
+        # point is only that the second position was not left for the host to
+        # ask for again.
+        assert len(fake.opened) == 3
 
 
 def test_jellyfin_seek_is_host_only(monkeypatch):

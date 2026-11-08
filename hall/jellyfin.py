@@ -76,6 +76,10 @@ MIME_BY_CONTAINER = {
 PLAYLIST_TIMEOUT = 20.0
 SEGMENT_TIMEOUT = 45.0
 SEGMENT_WAIT = 20.0
+# A restart kills the responses the old encoder was still streaming, so a
+# handful of readers lose the segment they were part-way through.  How many
+# times a segment is asked for before the player is told it failed.
+SEGMENT_TRY_LIMIT = 5
 
 
 class JellyfinError(Exception):
@@ -1043,7 +1047,9 @@ class JellyfinClient:
         if index not in hls.segments:
             raise JellyfinError("Jellyfin 播放列表里没有这个分片", "JELLYFIN_TRANSCODE_FAILED", 404)
         url = self._with_token(hls.segments[index], session)
+        tries = 0
         while True:
+            tries += 1
             try:
                 async with self.session.get(
                     url,
@@ -1060,6 +1066,11 @@ class JellyfinClient:
                         raise JellyfinError(
                             "转码分片还没准备好", "JELLYFIN_TRANSCODE_FAILED", 404
                         )
+                    if response.status >= 500 and tries < SEGMENT_TRY_LIMIT:
+                        # Replacing an encoder makes Jellyfin answer 5xx for a
+                        # moment -- the same moment that drops connections.
+                        await asyncio.sleep(0.4)
+                        continue
                     if response.status >= 400:
                         raise JellyfinError(
                             f"Jellyfin 分片读取失败（HTTP {response.status}）",
@@ -1071,6 +1082,20 @@ class JellyfinClient:
             except asyncio.TimeoutError:
                 raise JellyfinError("Jellyfin 分片读取超时", "JELLYFIN_TRANSCODE_FAILED", 504)
             except aiohttp.ClientError as exc:
+                # Stopping an encoding kills the response the segment was
+                # arriving on, so a seek leaves a few readers with an aborted
+                # connection.  Retrying picks the segment up from the stream
+                # that replaced it; only a connection that stays broken is
+                # worth telling the player about.
+                if tries < SEGMENT_TRY_LIMIT:
+                    await asyncio.sleep(0.4)
+                    continue
+                logger.warning(
+                    "Jellyfin segment read failed index=%s after %d tries: %s",
+                    index,
+                    tries,
+                    exc,
+                )
                 raise JellyfinError(f"连接 Jellyfin 失败: {exc}", "JELLYFIN_UNAVAILABLE", 502)
 
     async def stop_transcode(self, session: JellyfinSession, hls: HlsSession) -> None:

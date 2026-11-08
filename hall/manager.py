@@ -873,16 +873,27 @@ class HallManager:
             self._seek_tasks[room.room_id] = task
 
     async def _run_seek(self, room: Room) -> None:
+        """Restart the transcode at the host's latest position.
+
+        A drag arrives as a burst of seeks and a restart takes seconds, so this
+        waits for the target to hold still before spending one.  A seek that
+        lands while the restart runs is not lost either: the loop comes round
+        again, so the room ends up on the position the host let go of rather
+        than on whichever one happened to reach the transcoder first.
+        """
         delay = self.config.jellyfin.seek_debounce_ms / 1000.0
         try:
             while True:
-                target = room.pending_seek
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                if room.pending_seek != target:
-                    continue
-                break
-            await self._restart_transcode(room, target)
+                while True:
+                    target = room.pending_seek
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    if room.pending_seek != target:
+                        continue
+                    break
+                await self._restart_transcode(room, target)
+                if room.pending_seek == target:
+                    break
         except asyncio.CancelledError:
             raise
         except Exception:
