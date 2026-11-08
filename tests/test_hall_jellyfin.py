@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 import api
 from hall.jellyfin import (
     DEFAULT_TRANSCODE_BITRATE,
+    JellyfinAuthError,
     MAX_TRANSCODE_BITRATE,
     MIN_TRANSCODE_BITRATE,
     HlsSession,
@@ -15,11 +16,12 @@ from hall.jellyfin import (
     JellyfinSession,
     clamp_bitrate,
     clean_vtt,
+    normalize_jellyfin_url,
     playback_mode,
     segment_item_offset,
     subtitle_streams,
 )
-from hall.manager import HallConfig, HallManager, JellyfinConfig
+from hall.manager import JELLYFIN_CLIENT_LIMIT, HallConfig, HallManager, JellyfinConfig
 
 
 class FakeRecordManager:
@@ -32,6 +34,10 @@ class FakeRecordManager:
     async def list_records(self, name):
         return []
 
+
+# The API key every test connects with, and the address it belongs to.
+TEST_KEY = "test-key-not-a-real-one"
+TEST_URL = "http://jelly.invalid"
 
 MASTER_TEXT = """#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=6192000,CODECS="avc1.424029,mp4a.40.2",RESOLUTION=1280x720
@@ -54,7 +60,7 @@ class FakeJellyfinClient(JellyfinClient):
     """The real parsing logic, with every HTTP hop answered locally."""
 
     def __init__(self):
-        super().__init__(None, "http://jelly.invalid", 8_000_000)
+        super().__init__(None, TEST_URL, 8_000_000)
         self.playlist_calls = 0
         self.stopped = []
         self.opened = []
@@ -88,23 +94,17 @@ class FakeJellyfinClient(JellyfinClient):
             return LIVE_TEXT
         return {}
 
-    async def authenticate(self, username, password, device_id):
-        if password != "secret":
-            raise JellyfinError("Jellyfin 用户名或密码不正确", "JELLYFIN_AUTH_FAILED", 401)
-        return JellyfinSession(
-            token="TOKEN-SECRET-VALUE",
-            user_id="user-1",
-            user_name=username,
-            device_id=device_id,
-        )
-
     async def verify(self, token, device_id, user_id=None):
-        if token != "TOKEN-SECRET-VALUE":
-            raise JellyfinError("Jellyfin 认证已失效，请重新登录", "JELLYFIN_AUTH_FAILED", 401)
+        if token != TEST_KEY:
+            raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
         if user_id and user_id != "user-1":
-            raise JellyfinError("Jellyfin 认证已失效，请重新登录", "JELLYFIN_AUTH_FAILED", 401)
+            raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
         return JellyfinSession(
-            token=token, user_id="user-1", user_name="hehesheng", device_id=device_id
+            token=token,
+            user_id="user-1",
+            user_name="hehesheng",
+            device_id=device_id,
+            base_url=self.base_url,
         )
 
     async def libraries(self, session):
@@ -234,7 +234,6 @@ def _client(monkeypatch, max_bitrate=8_000_000):
             HallConfig(
                 jellyfin=JellyfinConfig(
                     enabled=True,
-                    url="http://jelly.invalid",
                     max_bitrate=max_bitrate,
                     seek_debounce_ms=0,
                 )
@@ -250,8 +249,11 @@ def _hall(client):
 
 
 def _fake(client):
+    """Answer every Jellyfin hop locally, for the address the tests use."""
     fake = FakeJellyfinClient()
-    _hall(client).jellyfin = fake
+    # The manager builds one client per address now; seeding the cache for
+    # the test address hands it the fake instead of a real aiohttp client.
+    _hall(client)._jellyfin_clients[fake.base_url] = fake
     return fake
 
 
@@ -261,10 +263,13 @@ def _create_room(client):
     return response.json()
 
 
-def _login(client, room, password="secret"):
+def _login(client, room, token=TEST_KEY, url=TEST_URL, user_id=None):
+    payload = {"url": url, "token": token}
+    if user_id:
+        payload["user_id"] = user_id
     return client.post(
         f"/hall/api/rooms/{room['room_code']}/jellyfin/session",
-        json={"username": "hehesheng", "password": password},
+        json=payload,
         headers={"X-Host-Token": room["host_token"]},
     )
 
@@ -282,6 +287,103 @@ def _item(client, room, item_id):
 
 
 # -- pure helpers ------------------------------------------------------
+
+
+def test_the_hosts_url_is_tidied_into_something_we_can_call():
+    assert normalize_jellyfin_url("jellyfin.example.com") == "https://jellyfin.example.com"
+    # A server mounted under a subdirectory keeps its prefix, and a port and
+    # an IPv6 literal both survive.
+    assert normalize_jellyfin_url(" http://nas:8096/jellyfin/ ") == "http://nas:8096/jellyfin"
+    assert normalize_jellyfin_url("http://[::1]:8096") == "http://[::1]:8096"
+
+
+def test_a_url_that_is_not_an_address_is_refused():
+    for raw in (
+        "",
+        "   ",
+        "ftp://jelly.invalid",
+        "javascript:alert(1)",
+        "https://user:pass@jelly.invalid",
+        "https://jelly.invalid/?api_key=leak",
+        "https://jelly.invalid/#frag",
+        "https://jelly invalid",
+        "https://" + "x" * 300,
+    ):
+        with pytest.raises(JellyfinError) as raised:
+            normalize_jellyfin_url(raw)
+        assert raised.value.status_code == 400, raw
+        assert raised.value.code in (
+            "JELLYFIN_URL_INVALID",
+            "JELLYFIN_CONFIG_REQUIRED",
+        ), raw
+
+
+def test_a_legacy_config_with_only_a_url_still_counts_as_enabled():
+    # A deployment that only ever had an address must not lose the feature
+    # just because the address moved to the browser.
+    assert JellyfinConfig.from_payload({"url": "https://jelly.invalid"}).enabled is True
+    assert (
+        JellyfinConfig.from_payload({"url": "https://jelly.invalid", "enabled": False}).enabled
+        is False
+    )
+    assert JellyfinConfig.from_payload({}).enabled is False
+    # The address is not kept anywhere on the server any more.
+    assert not hasattr(JellyfinConfig.from_payload({"url": "https://x"}), "url")
+    assert (
+        JellyfinConfig.from_payload({"url": "https://x", "max_bitrate": 3_000_000}).max_bitrate
+        == 3_000_000
+    )
+
+
+def test_the_account_a_key_belongs_to_is_picked_from_the_server():
+    client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
+    users = [
+        {"Id": "u1", "Name": "kid", "Policy": {"IsAdministrator": False}},
+        {"Id": "u2", "Name": "hehesheng", "Policy": {"IsAdministrator": True}},
+    ]
+
+    async def fake_json(method, path, session=None, **kwargs):
+        if path == "/Users/Me":
+            # 10.10 answers this for an API key rather than a user token.
+            raise JellyfinError("Jellyfin 返回 HTTP 400", "JELLYFIN_UNAVAILABLE")
+        assert path == "/Users"
+        return users
+
+    client._json = fake_json
+    session = asyncio.run(client.verify("some-key", "dev-1"))
+    # Several accounts and no "me": the administrator is the one who could
+    # have minted this key, so that is the account we browse as.
+    assert (session.user_id, session.user_name) == ("u2", "hehesheng")
+    assert session.base_url == "http://jelly.invalid"
+    assert session.device_id == "dev-1"
+
+
+def test_a_user_token_is_answered_by_users_me():
+    client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
+    seen = []
+
+    async def fake_json(method, path, session=None, **kwargs):
+        seen.append(path)
+        return {"Id": "u9", "Name": "hehesheng"}
+
+    client._json = fake_json
+    session = asyncio.run(client.verify("user-token", "dev-1"))
+    assert seen == ["/Users/Me"]
+    assert (session.user_id, session.user_name) == ("u9", "hehesheng")
+
+
+def test_a_remembered_user_id_is_looked_up_directly():
+    client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
+    seen = []
+
+    async def fake_json(method, path, session=None, **kwargs):
+        seen.append(path)
+        return {"Id": "u9", "Name": "hehesheng"}
+
+    client._json = fake_json
+    session = asyncio.run(client.verify("user-token", "dev-1", user_id="u9"))
+    assert seen == ["/Users/u9"]
+    assert session.user_id == "u9"
 
 
 def test_playback_mode_splits_between_direct_and_transcode():
@@ -582,7 +684,7 @@ def test_clean_vtt_drops_ass_overrides_and_region_header():
 # -- authentication ----------------------------------------------------
 
 
-def test_jellyfin_needs_login_before_items_can_be_added(monkeypatch):
+def test_jellyfin_needs_connecting_before_items_can_be_added(monkeypatch):
     with _client(monkeypatch) as client:
         _fake(client)
         room = _create_room(client)
@@ -590,21 +692,100 @@ def test_jellyfin_needs_login_before_items_can_be_added(monkeypatch):
         assert denied.status_code == 401
         assert denied.json()["code"] == "JELLYFIN_AUTH_REQUIRED"
 
-        status_body = client.get(f"/hall/api/rooms/{room['room_code']}/jellyfin/status").json()
+        headers = {"X-Host-Token": room["host_token"]}
+        status_body = client.get(
+            f"/hall/api/rooms/{room['room_code']}/jellyfin/status", headers=headers
+        ).json()
+        # The deployment switch is on; the room has not been pointed at a
+        # server yet, and those are two different answers.
         assert status_body["enabled"] is True
         assert status_body["authenticated"] is False
 
 
-def test_jellyfin_login_rejects_a_wrong_password(monkeypatch):
+def test_jellyfin_status_names_the_hosts_account_only_to_the_host(monkeypatch):
     with _client(monkeypatch) as client:
         _fake(client)
         room = _create_room(client)
-        bad = _login(client, room, password="nope")
+        _login(client, room)
+        url = f"/hall/api/rooms/{room['room_code']}/jellyfin/status"
+
+        # Knowing the room code is not a reason to learn which Jellyfin
+        # account the host browses with.
+        assert client.get(url).status_code == 403
+        member = client.post(
+            f"/hall/api/rooms/{room['room_code']}/join", json={"name": "bob"}
+        ).json()
+        denied = client.get(url, headers={"X-Host-Token": member["member_token"]})
+        assert denied.status_code == 403
+
+        body = client.get(url, headers={"X-Host-Token": room["host_token"]}).json()
+        assert body["authenticated"] is True
+        assert body["jellyfin"]["user_name"] == "hehesheng"
+
+
+def test_a_bare_host_becomes_an_https_address(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        bare = FakeJellyfinClient()
+        bare.base_url = "https://jelly.invalid"
+        _hall(client)._jellyfin_clients[bare.base_url] = bare
+
+        # The host types "jelly.invalid"; what ends up stored and used is the
+        # address form, and the browser is told which one that is.
+        ok = _login(client, room, url="jelly.invalid")
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["url"] == "https://jelly.invalid"
+        assert _hall(client).get_room(room["room_code"]).jellyfin.base_url == "https://jelly.invalid"
+
+
+def test_jellyfin_connect_rejects_a_wrong_key(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        bad = _login(client, room, token="nope")
         assert bad.status_code == 401
         assert bad.json()["code"] == "JELLYFIN_AUTH_FAILED"
+        # The message talks about the key that was just typed, not about a
+        # session that expired.
+        assert "密钥" in bad.json()["message"]
 
 
-def test_jellyfin_login_returns_libraries_and_never_the_token(monkeypatch):
+def test_jellyfin_connect_needs_both_a_url_and_a_key(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        for payload in (
+            {"token": TEST_KEY},
+            {"url": TEST_URL},
+            {"url": "   ", "token": TEST_KEY},
+        ):
+            response = client.post(
+                f"/hall/api/rooms/{room['room_code']}/jellyfin/session",
+                json=payload,
+                headers={"X-Host-Token": room["host_token"]},
+            )
+            assert response.status_code == 400
+            assert response.json()["code"] == "JELLYFIN_CONFIG_REQUIRED"
+
+
+def test_jellyfin_connect_refuses_addresses_that_are_not_a_server(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        for url in (
+            "ftp://jelly.invalid",
+            "javascript:alert(1)",
+            "https://user:pass@jelly.invalid",
+            "https://jelly.invalid/?api_key=leak",
+            "https://jelly.invalid/#frag",
+        ):
+            response = _login(client, room, url=url)
+            assert response.status_code == 400, url
+            assert response.json()["code"] == "JELLYFIN_URL_INVALID", url
+
+
+def test_jellyfin_connect_returns_libraries_and_never_echoes_the_key(monkeypatch):
     with _client(monkeypatch) as client:
         _fake(client)
         room = _create_room(client)
@@ -613,21 +794,24 @@ def test_jellyfin_login_returns_libraries_and_never_the_token(monkeypatch):
         body = ok.json()
         assert body["jellyfin"]["user_name"] == "hehesheng"
         assert [lib["name"] for lib in body["libraries"]] == ["电影"]
-        # The host gets its own token back so the browser can remember it.
-        assert body["token"] == "TOKEN-SECRET-VALUE"
+        # The browser is told the address the server settled on, so what it
+        # stores is what is in use.
+        assert body["url"] == TEST_URL
+        # The browser already has the key; the server has no reason to hand
+        # it back, and nothing in the hall may repeat it.
+        assert "token" not in body
 
-        # ...but nothing else in the hall may repeat it.
         info = client.get(f"/hall/api/rooms/{room['room_code']}")
         member = client.post(
             f"/hall/api/rooms/{room['room_code']}/join", json={"name": "bob"}
         )
         listed = client.get("/hall/api/rooms")
-        for response in (info, member, listed):
-            assert "TOKEN-SECRET-VALUE" not in response.text
-
-        status_body = client.get(f"/hall/api/rooms/{room['room_code']}/jellyfin/status").json()
-        assert status_body["authenticated"] is True
-        assert "TOKEN-SECRET-VALUE" not in str(status_body)
+        status = client.get(
+            f"/hall/api/rooms/{room['room_code']}/jellyfin/status",
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        for response in (ok, info, member, listed, status):
+            assert TEST_KEY not in response.text
 
 
 def test_jellyfin_browse_requires_a_session(monkeypatch):
@@ -909,29 +1093,22 @@ def test_jellyfin_library_is_visible_only_to_the_host(monkeypatch):
         assert anonymous.status_code == 403
 
 
-def test_jellyfin_remembers_a_token_instead_of_the_password(monkeypatch):
+def test_jellyfin_reconnects_with_the_key_the_browser_remembered(monkeypatch):
     with _client(monkeypatch) as client:
         _fake(client)
         room = _create_room(client)
-        headers = {"X-Host-Token": room["host_token"]}
-        adopted = client.post(
-            f"/hall/api/rooms/{room['room_code']}/jellyfin/session",
-            json={"token": "TOKEN-SECRET-VALUE", "user_id": "user-1"},
-            headers=headers,
-        )
+        # The browser sends back the account it was given last time, so the
+        # server does not have to guess which user the key belongs to.
+        adopted = _login(client, room, user_id="user-1")
         assert adopted.status_code == 200, adopted.text
         assert adopted.json()["jellyfin"]["user_id"] == "user-1"
 
-        stale = client.post(
-            f"/hall/api/rooms/{room['room_code']}/jellyfin/session",
-            json={"token": "EXPIRED-TOKEN", "user_id": "user-1"},
-            headers=headers,
-        )
+        stale = _login(client, room, token="expired-key", user_id="user-1")
         assert stale.status_code == 401
         assert stale.json()["code"] == "JELLYFIN_AUTH_FAILED"
 
 
-def test_jellyfin_login_is_host_only(monkeypatch):
+def test_jellyfin_connect_is_host_only(monkeypatch):
     with _client(monkeypatch) as client:
         _fake(client)
         room = _create_room(client)
@@ -940,10 +1117,65 @@ def test_jellyfin_login_is_host_only(monkeypatch):
         ).json()
         denied = client.post(
             f"/hall/api/rooms/{room['room_code']}/jellyfin/session",
-            json={"username": "hehesheng", "password": "secret"},
+            json={"url": TEST_URL, "token": TEST_KEY},
             headers={"X-Host-Token": member["member_token"]},
         )
         assert denied.status_code == 403
+
+
+def test_two_rooms_can_point_at_two_different_servers(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        manager = _hall(client)
+        first = _create_room(client)
+        second = _create_room(client)
+        _login(client, first)
+        # The second room's host runs their own Jellyfin.
+        other_url = "http://other-jelly.invalid"
+        other = FakeJellyfinClient()
+        other.base_url = other_url
+        manager._jellyfin_clients[other_url] = other
+        connected = client.post(
+            f"/hall/api/rooms/{second['room_code']}/jellyfin/session",
+            json={"url": other_url, "token": TEST_KEY},
+            headers={"X-Host-Token": second["host_token"]},
+        )
+        assert connected.status_code == 200, connected.text
+
+        assert manager.get_room(first["room_code"]).jellyfin.base_url == TEST_URL
+        assert manager.get_room(second["room_code"]).jellyfin.base_url == other_url
+        # Each room browses its own server: the listing lands on the client
+        # built for that address, not on whichever one was used first.
+        client.get(
+            f"/hall/api/rooms/{second['room_code']}/jellyfin/items",
+            headers={"X-Host-Token": second["host_token"]},
+        )
+        assert fake.item_calls == []
+        assert len(other.item_calls) == 1
+
+
+def test_jellyfin_clients_stay_bounded(monkeypatch):
+    with _client(monkeypatch) as client:
+        manager = _hall(client)
+
+        def session_for(index):
+            return JellyfinSession(
+                token="k",
+                user_id="u",
+                user_name="n",
+                device_id="d",
+                base_url=f"http://jelly-{index}.invalid",
+            )
+
+        total = JELLYFIN_CLIENT_LIMIT + 4
+        for index in range(total):
+            manager.jellyfin_for(session_for(index))
+        assert len(manager._jellyfin_clients) == JELLYFIN_CLIENT_LIMIT
+        # The oldest addresses fell out; asking for a recent one again hands
+        # back the client that is already there instead of a new one.
+        assert "http://jelly-0.invalid" not in manager._jellyfin_clients
+        last = f"http://jelly-{total - 1}.invalid"
+        assert manager.jellyfin_for(session_for(total - 1)) is manager._jellyfin_clients[last]
 
 
 # -- direct playback ---------------------------------------------------

@@ -37,12 +37,17 @@ class MediaPayload(BaseModel):
     item_id: Optional[str] = None
 
 
-class JellyfinLoginRequest(BaseModel):
-    username: str = Field(default="", max_length=64)
-    password: str = Field(default="", max_length=256)
-    token: Optional[str] = None
-    # Returned by the login call and echoed back with a remembered token, so
-    # the server can look the account up without relying on /Users/Me.
+class JellyfinConnectRequest(BaseModel):
+    """What the host's browser hands over when it connects a room.
+
+    The address is the host's, not the deployment's: nothing about this
+    Jellyfin server is configured on the server side.  ``user_id`` is optional
+    and only a hint -- it is what the browser remembered from last time, and
+    the server falls back to asking Jellyfin which account the key belongs to.
+    """
+
+    url: str = Field(default="", max_length=512)
+    token: str = Field(default="", max_length=512)
     user_id: Optional[str] = Field(default=None, max_length=64)
 
 
@@ -256,14 +261,16 @@ async def join_room(room_ref: str, payload: JoinRequest, request: Request):
 @router.post("/api/rooms/{room_ref}/jellyfin/session")
 async def jellyfin_session(
     room_ref: str,
-    payload: JellyfinLoginRequest,
+    payload: JellyfinConnectRequest,
     request: Request,
     x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
 ):
-    """Sign the host in to Jellyfin, or adopt a token the browser remembered.
+    """Connect the room to the Jellyfin server the host typed in.
 
-    The password is used for this one call and never stored.  The resulting
-    token stays on the room and is never returned to a client.
+    The address and the API key both come from the browser and stay on the
+    room for as long as it lives; the server keeps no Jellyfin configuration
+    of its own.  The key is never echoed back -- the browser already has it,
+    and every other endpoint stays free of it.
     """
     hall = _hall(request)
     if hall is None:
@@ -271,25 +278,27 @@ async def jellyfin_session(
     room = hall.get_room(room_ref)
     if room is None:
         return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    if not payload.url.strip() or not payload.token.strip():
+        return _error_json(
+            status.HTTP_400_BAD_REQUEST,
+            protocol.ERR_JELLYFIN_CONFIG_REQUIRED,
+            "请填写 Jellyfin 网址和密钥",
+        )
     try:
-        if payload.token:
-            session = await hall.jellyfin_attach_token(
-                room, x_host_token or "", payload.token, payload.user_id
-            )
-        else:
-            session = await hall.jellyfin_login(
-                room,
-                x_host_token or "",
-                payload.username.strip(),
-                payload.password,
-            )
+        session = await hall.jellyfin_connect(
+            room,
+            x_host_token or "",
+            payload.url,
+            payload.token,
+            payload.user_id,
+        )
         libraries = await hall.jellyfin_libraries(room)
     except HallError as exc:
         return _hall_error(exc)
-    # The host gets the token back so this browser can stay signed in for a
-    # week.  It is the host's own credential — every other endpoint, and every
-    # payload a member can read, stays free of it.
-    return {"jellyfin": session.public(), "libraries": libraries, "token": session.token}
+    # The address comes back the way the server settled on it (a bare host
+    # gained https://), so the browser can store and show exactly what is in
+    # use.  The key does not: the browser sent it.
+    return {"jellyfin": session.public(), "libraries": libraries, "url": session.base_url}
 
 
 @router.get("/api/rooms/{room_ref}/jellyfin/items")
@@ -321,21 +330,26 @@ async def jellyfin_items(
 
 
 @router.get("/api/rooms/{room_ref}/jellyfin/status")
-async def jellyfin_status(room_ref: str, request: Request):
-    """What the host view needs to know before it shows the Jellyfin menu."""
+async def jellyfin_status(
+    room_ref: str,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    """What the host view needs before it shows the Jellyfin menu.
+
+    Host-only: the answer names the Jellyfin account this room browses with,
+    and knowing the room code is not a reason to learn that.
+    """
     hall = _hall(request)
     if hall is None:
         return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
     room = hall.get_room(room_ref)
     if room is None:
         return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
-    config = hall.config.jellyfin
-    return {
-        "enabled": bool(config.enabled and hall.jellyfin is not None),
-        "authenticated": room.jellyfin is not None,
-        "jellyfin": room.jellyfin.public() if room.jellyfin else None,
-        "max_bitrate": config.max_bitrate,
-    }
+    try:
+        return hall.jellyfin_status(room, x_host_token or "")
+    except HallError as exc:
+        return _hall_error(exc)
 
 
 @router.post("/api/rooms/{room_ref}/hls/seek")

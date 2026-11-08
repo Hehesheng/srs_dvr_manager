@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,6 +27,7 @@ from .jellyfin import (
     duration_seconds,
     item_kind,
     item_name,
+    normalize_jellyfin_url,
     playback_mode,
     subtitle_streams,
     text_subtitle_streams,
@@ -84,10 +86,14 @@ class HallError(Exception):
 
 JELLYFIN_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
-    "url": "",
     "max_bitrate": 8_000_000,
     "seek_debounce_ms": 800,
 }
+
+# How many distinct Jellyfin servers keep a client.  A client is only a bitrate
+# ceiling on top of the hall's one aiohttp session (nothing to close, nothing to
+# leak), so this is a memo-size bound, not a resource limit.
+JELLYFIN_CLIENT_LIMIT = 16
 
 
 @dataclass
@@ -105,20 +111,30 @@ class BuiltMedia:
 
 @dataclass
 class JellyfinConfig:
-    """Where the Jellyfin server lives, and how hard we are allowed to pull."""
+    """Whether the hall offers Jellyfin at all, and how hard it may pull.
+
+    The server address is not here any more: each room's host types it in the
+    browser when connecting, so the same deployment can host rooms that point
+    at different Jellyfin servers (and nobody has to edit config.yaml and
+    restart to move to another one).
+    """
 
     enabled: bool = False
-    url: str = ""
     max_bitrate: int = 8_000_000
     seek_debounce_ms: int = 800
 
     @classmethod
     def from_payload(cls, payload: Optional[Dict[str, Any]]) -> "JellyfinConfig":
+        source = payload if isinstance(payload, dict) else {}
         merged = dict(JELLYFIN_DEFAULTS)
-        if isinstance(payload, dict):
-            merged.update({k: v for k, v in payload.items() if v is not None})
-        url = str(merged.get("url") or "").strip().rstrip("/")
-        enabled = bool(merged.get("enabled")) and url.startswith(("http://", "https://"))
+        merged.update({k: v for k, v in source.items() if v is not None})
+        if source.get("enabled") is None:
+            # A config written before addresses moved to the browser had no
+            # ``enabled`` switch, only a url.  Reading that as "on" is what
+            # keeps an upgrade from silently switching Jellyfin off.
+            enabled = bool(str(source.get("url") or "").strip())
+        else:
+            enabled = bool(source.get("enabled"))
         try:
             bitrate = int(merged.get("max_bitrate"))
         except (TypeError, ValueError):
@@ -129,7 +145,6 @@ class JellyfinConfig:
             debounce = JELLYFIN_DEFAULTS["seek_debounce_ms"]
         return cls(
             enabled=enabled,
-            url=url,
             max_bitrate=max(500_000, min(40_000_000, bitrate)),
             seek_debounce_ms=max(0, min(5000, debounce)),
         )
@@ -207,7 +222,10 @@ class HallManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._pulse_task: Optional[asyncio.Task] = None
         self._started = False
-        self.jellyfin: Optional[JellyfinClient] = None
+        # One client per Jellyfin address the hosts have used, because the
+        # address is per room now.  A client is just an aiohttp session plus a
+        # bitrate ceiling, so keeping a handful around costs nothing.
+        self._jellyfin_clients: "OrderedDict[str, JellyfinClient]" = OrderedDict()
         # One seek restart per room is enough; dragging must not spawn a
         # transcoder per pointer move.
         self._seek_tasks: Dict[str, asyncio.Task] = {}
@@ -228,12 +246,6 @@ class HallManager:
             timeout=aiohttp.ClientTimeout(total=25, connect=8, sock_read=20)
         )
         self._started = True
-        if self.config.jellyfin.enabled:
-            self.jellyfin = JellyfinClient(
-                self._session,
-                self.config.jellyfin.url,
-                self.config.jellyfin.max_bitrate,
-            )
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._pulse_task = asyncio.create_task(self._pulse_loop())
         logger.info(
@@ -242,7 +254,7 @@ class HallManager:
             self.config.block_size,
             self.config.cache_bytes_per_room,
             self.config.cache_bytes_total,
-            "on" if self.jellyfin else "off",
+            "on" if self.config.jellyfin.enabled else "off",
         )
 
     async def stop(self) -> None:
@@ -402,24 +414,22 @@ class HallManager:
     async def _build_jellyfin_media(
         self, media_payload: Dict[str, Any], room: Optional[Room], media_id: str
     ) -> "BuiltMedia":
-        if self.jellyfin is None:
-            raise HallError(
-                "Jellyfin 源未启用", protocol.ERR_JELLYFIN_UNAVAILABLE, 503
-            )
+        self._require_jellyfin_enabled()
         if room is None or room.jellyfin is None:
             raise HallError(
-                "请先登录 Jellyfin", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
+                "请先填写 Jellyfin 网址和密钥", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
             )
+        client = self.jellyfin_for(room.jellyfin)
         item_id = str(media_payload.get("item_id") or "").strip()
         if not item_id or not item_id.replace("-", "").isalnum():
             raise HallError("缺少有效的 Jellyfin 视频 ID")
 
         try:
-            item = await self.jellyfin.item(room.jellyfin, item_id)
+            item = await client.item(room.jellyfin, item_id)
         except JellyfinAuthError:
             room.jellyfin = None
             raise HallError(
-                "Jellyfin 登录已失效，请重新登录",
+                "Jellyfin 连接已失效，请重新填写网址和密钥",
                 protocol.ERR_JELLYFIN_AUTH_FAILED,
                 401,
             )
@@ -446,7 +456,7 @@ class HallManager:
             # Direct play gets real WebVTT tracks; there is no transcode to burn
             # subtitles into, so the picker has nothing to choose.
             try:
-                size = await self.jellyfin.probe_size(room.jellyfin, item_id)
+                size = await client.probe_size(room.jellyfin, item_id)
             except JellyfinError as exc:
                 raise HallError(exc.message, exc.code, exc.status_code)
             if size <= 0 or size > self.config.max_media_bytes:
@@ -465,13 +475,13 @@ class HallManager:
             return BuiltMedia(
                 media=media,
                 jellyfin_source=JellyfinSource(
-                    self.jellyfin, room.jellyfin, item_id, size, mime
+                    client, room.jellyfin, item_id, size, mime
                 ),
                 jellyfin_item=source,
             )
 
         try:
-            hls = await self.jellyfin.open_transcode(
+            hls = await client.open_transcode(
                 room.jellyfin,
                 item_id,
                 0.0,
@@ -540,21 +550,22 @@ class HallManager:
                 ),
             )
         if media.kind == "jellyfin":
-            if self.jellyfin is None or room.jellyfin is None:
+            if room.jellyfin is None:
                 raise HallError(
-                    "Jellyfin 登录已失效，请重新登录",
+                    "Jellyfin 连接已失效，请重新填写网址和密钥",
                     protocol.ERR_JELLYFIN_AUTH_REQUIRED,
                     401,
                 )
+            client = self.jellyfin_for(room.jellyfin)
             item_id = media.item_id or ""
             # Re-read the item: the subtitle list belongs to this title, and
             # the room may have been playing something else in between.
             try:
-                item = await self.jellyfin.item(room.jellyfin, item_id)
+                item = await client.item(room.jellyfin, item_id)
             except JellyfinAuthError:
                 room.jellyfin = None
                 raise HallError(
-                    "Jellyfin 登录已失效，请重新登录",
+                    "Jellyfin 连接已失效，请重新填写网址和密钥",
                     protocol.ERR_JELLYFIN_AUTH_FAILED,
                     401,
                 )
@@ -564,7 +575,7 @@ class HallManager:
             source = sources[0]
             if media.playback_mode == "hls":
                 try:
-                    hls = await self.jellyfin.open_transcode(
+                    hls = await client.open_transcode(
                         room.jellyfin,
                         item_id,
                         0.0,
@@ -577,58 +588,123 @@ class HallManager:
             return BuiltMedia(
                 media=media,
                 jellyfin_source=JellyfinSource(
-                    self.jellyfin, room.jellyfin, item_id, media.size, media.mime
+                    client, room.jellyfin, item_id, media.size, media.mime
                 ),
                 jellyfin_item=source,
             )
         return BuiltMedia(media=media)
 
     # -- jellyfin ------------------------------------------------------
-    def _require_jellyfin(self) -> JellyfinClient:
-        if self.jellyfin is None:
+    def _require_jellyfin_enabled(self) -> None:
+        if not self.config.jellyfin.enabled:
             raise HallError(
                 "Jellyfin 源未启用", protocol.ERR_JELLYFIN_UNAVAILABLE, 503
             )
-        return self.jellyfin
 
-    async def jellyfin_login(
-        self, room: Room, host_token: str, username: str, password: str
-    ) -> JellyfinSession:
+    def jellyfin_status(self, room: Room, host_token: str) -> Dict[str, Any]:
+        """Everything the host view needs before it opens the picker."""
         self._require_host(room, host_token)
-        client = self._require_jellyfin()
-        device_id = f"srs-hall-{room.room_id}"
+        return {
+            # `enabled` is the deployment switch only: whether this room has a
+            # server connected is the separate `authenticated` answer.
+            "enabled": bool(self.config.jellyfin.enabled),
+            "authenticated": room.jellyfin is not None,
+            "jellyfin": room.jellyfin.public() if room.jellyfin else None,
+            "max_bitrate": self.config.jellyfin.max_bitrate,
+        }
+
+    def jellyfin_for(self, session: Optional[JellyfinSession]) -> JellyfinClient:
+        """The client that talks to the server behind ``session``.
+
+        The address travels with the room now, so this is looked up (and built
+        on first use) rather than held on the manager.  Rooms that point at the
+        same address share one client; the LRU only bounds how many different
+        servers a long-lived process remembers.
+        """
+        base_url = (session.base_url if session else "").rstrip("/")
+        if not base_url:
+            raise HallError(
+                "请先填写 Jellyfin 网址和密钥", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
+            )
+        client = self._jellyfin_clients.get(base_url)
+        if client is not None:
+            self._jellyfin_clients.move_to_end(base_url)
+            return client
+        if self._session is None:
+            raise HallError("hall is not started", "HALL_UNAVAILABLE", 503)
+        client = JellyfinClient(
+            self._session, base_url, self.config.jellyfin.max_bitrate
+        )
+        self._jellyfin_clients[base_url] = client
+        while len(self._jellyfin_clients) > JELLYFIN_CLIENT_LIMIT:
+            self._jellyfin_clients.popitem(last=False)
+        return client
+
+    async def jellyfin_connect(
+        self,
+        room: Room,
+        host_token: str,
+        url: str,
+        token: str,
+        user_id: Optional[str] = None,
+    ) -> JellyfinSession:
+        """Adopt the server and API key the host typed into the browser.
+
+        The address is checked here rather than on the first library call, so
+        a typo comes back as a message about the address.  Connecting again
+        replaces whatever this room had before, which is what "换一个服务器"
+        does.
+        """
+        self._require_host(room, host_token)
+        self._require_jellyfin_enabled()
         try:
-            session = await client.authenticate(username, password, device_id)
+            base_url = normalize_jellyfin_url(url)
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+        token = str(token or "").strip()
+        if not token:
+            raise HallError(
+                "请填写 Jellyfin 密钥", protocol.ERR_JELLYFIN_CONFIG_REQUIRED, 400
+            )
+        if len(token) > 512:
+            raise HallError(
+                "Jellyfin 密钥太长了", protocol.ERR_JELLYFIN_CONFIG_REQUIRED, 400
+            )
+        probe = JellyfinSession(
+            token=token, user_id="", user_name="", device_id="", base_url=base_url
+        )
+        client = self.jellyfin_for(probe)
+        try:
+            session = await client.verify(
+                token, f"srs-hall-{room.room_id}", user_id
+            )
+        except JellyfinAuthError:
+            # "认证已失效" would be the wrong story here: this is the first
+            # use of a key the host just typed.
+            raise HallError(
+                "这枚密钥不能用，请检查网址和 API 密钥",
+                protocol.ERR_JELLYFIN_AUTH_FAILED,
+                401,
+            )
         except JellyfinError as exc:
             raise HallError(exc.message, exc.code, exc.status_code)
         room.jellyfin = session
         room.touch()
         logger.info(
-            "Jellyfin login room=%s user=%s", room.room_id, session.user_name
+            "Jellyfin connected room=%s server=%s user=%s",
+            room.room_id,
+            base_url,
+            session.user_name,
         )
         return session
 
-    async def jellyfin_attach_token(
-        self, room: Room, host_token: str, token: str, user_id: Optional[str] = None
-    ) -> JellyfinSession:
-        """Adopt a token the browser remembered from an earlier login."""
-        self._require_host(room, host_token)
-        client = self._require_jellyfin()
-        device_id = f"srs-hall-{room.room_id}"
-        try:
-            session = await client.verify(token, device_id, user_id)
-        except JellyfinError as exc:
-            raise HallError(exc.message, exc.code, exc.status_code)
-        room.jellyfin = session
-        room.touch()
-        return session
-
     async def jellyfin_libraries(self, room: Room) -> List[Dict[str, Any]]:
-        client = self._require_jellyfin()
+        self._require_jellyfin_enabled()
         if room.jellyfin is None:
             raise HallError(
-                "请先登录 Jellyfin", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
+                "请先填写 Jellyfin 网址和密钥", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
             )
+        client = self.jellyfin_for(room.jellyfin)
         try:
             return await client.libraries(room.jellyfin)
         except JellyfinAuthError:
@@ -654,11 +730,12 @@ class HallManager:
         # The library listing belongs to the host, not to whoever joined the
         # room; only the host may ask what is in it.
         self._require_host(room, host_token)
-        client = self._require_jellyfin()
+        self._require_jellyfin_enabled()
         if room.jellyfin is None:
             raise HallError(
-                "请先登录 Jellyfin", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
+                "请先填写 Jellyfin 网址和密钥", protocol.ERR_JELLYFIN_AUTH_REQUIRED, 401
             )
+        client = self.jellyfin_for(room.jellyfin)
         mode = mode if mode in ("children", "episodes") else "children"
         try:
             return await client.items(
@@ -790,10 +867,13 @@ class HallManager:
                 self._seek_tasks.pop(room.room_id, None)
 
     async def _restart_transcode(self, room: Room, position: float) -> None:
-        client = self.jellyfin
         session = room.jellyfin
         old = room.hls
-        if client is None or session is None or old is None or room.ended:
+        if session is None or old is None or room.ended:
+            return
+        try:
+            client = self.jellyfin_for(session)
+        except HallError:
             return
         try:
             fresh = await client.open_transcode(
@@ -807,7 +887,7 @@ class HallManager:
             )
         except JellyfinAuthError:
             room.jellyfin = None
-            logger.info("Jellyfin seek needs a new login room=%s", room.room_id)
+            logger.info("Jellyfin seek needs a reconnect room=%s", room.room_id)
             return
         except JellyfinError as exc:
             logger.warning(
@@ -830,12 +910,12 @@ class HallManager:
         )
 
     async def hls_playlist(self, room: Room) -> str:
-        client = self.jellyfin
         session = room.jellyfin
-        if client is None or session is None or room.hls is None or room.media is None:
+        if session is None or room.hls is None or room.media is None:
             raise HallError(
                 "转码会话不存在", protocol.ERR_JELLYFIN_TRANSCODE_FAILED, 404
             )
+        client = self.jellyfin_for(session)
         media = room.media
         epoch = room.media_epoch
         try:
@@ -850,12 +930,12 @@ class HallManager:
             raise HallError(exc.message, exc.code, exc.status_code)
 
     async def hls_segment(self, room: Room, index: int) -> bytes:
-        client = self.jellyfin
         session = room.jellyfin
-        if client is None or session is None or room.hls is None:
+        if session is None or room.hls is None:
             raise HallError(
                 "转码会话不存在", protocol.ERR_JELLYFIN_TRANSCODE_FAILED, 404
             )
+        client = self.jellyfin_for(session)
         try:
             return await room.cache.get_or_fetch(
                 index,
@@ -871,12 +951,16 @@ class HallManager:
         hls = room.hls
         session = room.jellyfin
         room.hls = None
-        if hls is not None and session is not None and self.jellyfin is not None:
-            asyncio.create_task(self.jellyfin.stop_transcode(session, hls))
+        if hls is not None and session is not None:
+            try:
+                client = self.jellyfin_for(session)
+            except HallError:
+                return
+            asyncio.create_task(client.stop_transcode(session, hls))
 
     def _spawn_jellyfin_subtitles(self, room: Room, media: MediaInfo) -> None:
         """Pull the item's text subtitle tracks in the background."""
-        if media.kind != "jellyfin" or self.jellyfin is None or room.jellyfin is None:
+        if media.kind != "jellyfin" or room.jellyfin is None:
             return
         if media.playback_mode != "direct":
             # A transcoded item has its subtitle burned into the picture by
@@ -894,7 +978,11 @@ class HallManager:
         self, room: Room, media: MediaInfo, tracks: List[Dict[str, Any]]
     ) -> None:
         session = room.jellyfin
-        if session is None or self.jellyfin is None:
+        if session is None:
+            return
+        try:
+            client = self.jellyfin_for(session)
+        except HallError:
             return
         source_id = str((room.jellyfin_item or {}).get("Id") or media.item_id or "")
         for track in tracks:
@@ -904,7 +992,7 @@ class HallManager:
                 index = int(track.get("Index"))
             except (TypeError, ValueError):
                 continue
-            text = await self.jellyfin.subtitle_vtt(session, media.item_id or "", source_id, index)
+            text = await client.subtitle_vtt(session, media.item_id or "", source_id, index)
             if not text:
                 continue
             if len(room.subtitles) >= MAX_SUBTITLES_PER_ROOM:

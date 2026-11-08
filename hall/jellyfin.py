@@ -1,14 +1,22 @@
-"""Jellyfin as a hall media source: login, browsing, direct play and HLS.
+"""Jellyfin as a hall media source: browsing, direct play and HLS.
 
-Everything here talks to exactly one server: the base URL from the hall
-config.  Requests are never built from URLs supplied by a browser, so this
-module deliberately does not go through ``upstream.validate_public_url`` --
-that guard exists for arbitrary public URLs, and it would also reject a NAS
-sitting on a private address.
+Which server this module talks to is decided per room: the host's browser
+hands the hall a base URL plus an API key when it connects the room, and the
+hall keeps that pair on the room for as long as it lives.  Nothing about
+Jellyfin -- neither the address nor the credential -- comes from the server
+configuration any more.
 
-The caller's Jellyfin token is the only credential involved.  It is kept in
-memory on the room and must never reach a member: members only ever see the
-hall's own signed URLs.
+That makes the base URL attacker-influenced in principle, so it is limited to
+a plain ``http(s)`` origin (plus an optional path prefix for servers mounted
+under a subdirectory) with no credentials, query or fragment in it, and only
+the holder of the room's host token can set it.  We still do not run the
+address through ``upstream.validate_public_url``: that guard exists for
+arbitrary public URLs, and a Jellyfin (or a NAS) sitting on a private address
+is a perfectly normal thing to point this at.
+
+The caller's API key is the only credential involved.  It is kept in memory
+on the room and must never reach a member: members only ever see the hall's
+own signed URLs.
 """
 
 import asyncio
@@ -88,14 +96,61 @@ class JellyfinAuthError(JellyfinError):
     code = "JELLYFIN_AUTH_FAILED"
 
 
+# A host: letters, digits, dots, dashes and underscores (a NAS on the LAN has
+# no dot), or a bracketed IPv6 literal, optionally with a port.
+_HOST_PORT_RE = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::[0-9]{1,5})?$")
+
+
+def normalize_jellyfin_url(raw: Any) -> str:
+    """Turn what the host typed into the base URL we will call.
+
+    Accepts ``host`` (https assumed), ``https://host`` and ``https://host/jf``
+    for servers mounted under a subdirectory.  Refuses anything that is not
+    plain http(s), carries credentials in front of the host, or hides a query
+    or fragment -- a base URL is a place, not a request.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise JellyfinError("请填写 Jellyfin 网址", "JELLYFIN_CONFIG_REQUIRED", 400)
+    if len(text) > 255:
+        raise JellyfinError("Jellyfin 网址太长了", "JELLYFIN_URL_INVALID", 400)
+    if any(char.isspace() for char in text):
+        # This string ends up glued in front of API paths; whitespace there is
+        # always a paste accident, never an address.
+        raise JellyfinError("Jellyfin 网址里不要有空格", "JELLYFIN_URL_INVALID", 400)
+    if "://" not in text:
+        text = f"https://{text}"
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        raise JellyfinError("Jellyfin 网址格式不对", "JELLYFIN_URL_INVALID", 400)
+    if parsed.scheme not in ("http", "https"):
+        raise JellyfinError("Jellyfin 网址要以 http:// 或 https:// 开头", "JELLYFIN_URL_INVALID", 400)
+    if "@" in parsed.netloc:
+        raise JellyfinError("Jellyfin 网址里不要带用户名和密码", "JELLYFIN_URL_INVALID", 400)
+    if not _HOST_PORT_RE.match(parsed.netloc):
+        raise JellyfinError("Jellyfin 网址格式不对", "JELLYFIN_URL_INVALID", 400)
+    if parsed.query or parsed.fragment:
+        raise JellyfinError("Jellyfin 网址只填到服务器地址，不要带参数", "JELLYFIN_URL_INVALID", 400)
+    # A server under /jellyfin is real, so keep the path; let the client join
+    # API paths onto it exactly like it did with the old configured URL.
+    return text.rstrip("/")
+
+
 @dataclass
 class JellyfinSession:
-    """One host's authenticated view of the Jellyfin server."""
+    """One host's authenticated view of one Jellyfin server.
+
+    ``base_url`` rides along because the address is per room now: every call
+    this session makes has to go back to the same server the host typed in,
+    and rooms in the same process may well point at different ones.
+    """
 
     token: str
     user_id: str
     user_name: str
     device_id: str
+    base_url: str = ""
 
     def public(self) -> Dict[str, Any]:
         # Never includes the token: this dict is safe to broadcast.
@@ -459,74 +514,66 @@ class JellyfinClient:
         except aiohttp.ClientError as exc:
             raise JellyfinError(f"连接 Jellyfin 失败: {exc}", "JELLYFIN_UNAVAILABLE", 502)
 
-    # -- login ---------------------------------------------------------
-    async def authenticate(
-        self, username: str, password: str, device_id: str
-    ) -> JellyfinSession:
-        url = self.absolute("/Users/AuthenticateByName")
-        try:
-            async with self.session.post(
-                url,
-                headers={**self._headers(None, device_id), "Content-Type": "application/json"},
-                json={"Username": username, "Pw": password},
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as response:
-                if response.status in (401, 403):
-                    raise JellyfinAuthError("Jellyfin 用户名或密码不正确")
-                if response.status >= 400:
-                    raise JellyfinError(
-                        f"Jellyfin 登录失败（HTTP {response.status}）", "JELLYFIN_UNAVAILABLE"
-                    )
-                payload = await response.json(content_type=None)
-        except JellyfinError:
-            raise
-        except asyncio.TimeoutError:
-            raise JellyfinError("连接 Jellyfin 超时", "JELLYFIN_UNAVAILABLE", 504)
-        except aiohttp.ClientError as exc:
-            raise JellyfinError(f"连接 Jellyfin 失败: {exc}", "JELLYFIN_UNAVAILABLE", 502)
-
-        token = str(payload.get("AccessToken") or "")
-        user = payload.get("User") or {}
-        if not token or not user.get("Id"):
-            raise JellyfinAuthError("Jellyfin 没有返回有效的访问令牌")
-        return JellyfinSession(
-            token=token,
-            user_id=str(user.get("Id")),
-            user_name=str(user.get("Name") or username),
-            device_id=device_id,
-        )
-
+    # -- connecting ----------------------------------------------------
     async def verify(
         self, token: str, device_id: str, user_id: Optional[str] = None
     ) -> JellyfinSession:
-        """Check a token the browser remembered, and read back who it belongs to.
+        """Check an API key and work out which account our library calls run as.
 
-        ``/Users/Me`` is not reliable across server builds (10.10 answers 400
-        when the token belongs to an API key rather than a signed-in user), so
-        the browser hands back the user id it was given at login and we look
-        that up directly.
+        Jellyfin needs a user id for browsing and playback, but an API key --
+        the thing a host actually pastes -- is owned by the server rather than
+        by one account.  So: trust a remembered user id if the browser has one,
+        otherwise ask ``/Users/Me`` (right for a user token), and otherwise
+        read the account list and take the only user, or the first
+        administrator when there are several.
         """
-        probe = JellyfinSession(token=token, user_id=user_id or "", user_name="", device_id=device_id)
+        probe = JellyfinSession(
+            token=token, user_id=user_id or "", user_name="", device_id=device_id,
+            base_url=self.base_url,
+        )
+        payload: Optional[Dict[str, Any]] = None
         if user_id:
-            payload = await self._json("GET", f"/Users/{user_id}", probe)
-            if not isinstance(payload, dict) or str(payload.get("Id") or "") != user_id:
-                raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
-        else:
-            users = await self._json("GET", "/Users", probe)
-            candidates = [
-                user for user in (users or []) if isinstance(user, dict) and user.get("Id")
-            ]
-            if len(candidates) != 1:
-                # More than one account: only the host knows which one it is.
-                raise JellyfinAuthError("记住的登录已失效，请重新登录", "JELLYFIN_AUTH_FAILED", 401)
-            payload = candidates[0]
-            user_id = str(payload.get("Id"))
+            found = await self._json("GET", f"/Users/{user_id}", probe)
+            if isinstance(found, dict) and str(found.get("Id") or "") == user_id:
+                payload = found
+            else:
+                raise JellyfinAuthError("Jellyfin 密钥无效或账号已不存在")
+        if payload is None:
+            payload = await self._resolve_user(probe)
         return JellyfinSession(
             token=token,
-            user_id=user_id,
+            user_id=str(payload.get("Id") or ""),
             user_name=str(payload.get("Name") or ""),
             device_id=device_id,
+            base_url=self.base_url,
         )
+
+    async def _resolve_user(self, probe: JellyfinSession) -> Dict[str, Any]:
+        """Ask Jellyfin who we are, falling back to picking from its user list."""
+        try:
+            me = await self._json("GET", "/Users/Me", probe)
+            if isinstance(me, dict) and me.get("Id"):
+                return me
+        except JellyfinAuthError:
+            raise
+        except JellyfinError:
+            # 10.10 answers 400 here for an API key: the key is not a signed-in
+            # user, so there is no "me".  The account list works either way.
+            pass
+        users = await self._json("GET", "/Users", probe)
+        candidates = [
+            user for user in (users or []) if isinstance(user, dict) and user.get("Id")
+        ]
+        if not candidates:
+            raise JellyfinAuthError("这枚密钥看不到任何 Jellyfin 账号")
+        if len(candidates) == 1:
+            return candidates[0]
+        admins = [
+            user
+            for user in candidates
+            if isinstance(user.get("Policy"), dict) and user["Policy"].get("IsAdministrator")
+        ]
+        return (admins or candidates)[0]
 
     # -- browsing ------------------------------------------------------
     async def libraries(self, session: JellyfinSession) -> List[Dict[str, Any]]:
