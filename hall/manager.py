@@ -104,7 +104,12 @@ class HallError(Exception):
 
 JELLYFIN_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
-    "max_bitrate": 8_000_000,
+    # The ceiling the room menu is cut down to.  It has to reach the top of the
+    # ladder the host picks from, or a deployment that never touched the setting
+    # silently loses the quality steps above it -- 10 and 12 Mbps were unselectable
+    # because this default stopped at 8.  Raise it per deployment (up to 40) when
+    # the uplink can carry more; lowering it still holds a room to less.
+    "max_bitrate": 12_000_000,
     "seek_debounce_ms": 800,
 }
 
@@ -138,7 +143,7 @@ class JellyfinConfig:
     """
 
     enabled: bool = False
-    max_bitrate: int = 8_000_000
+    max_bitrate: int = 12_000_000
     seek_debounce_ms: int = 800
 
     @classmethod

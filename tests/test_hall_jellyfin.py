@@ -1659,6 +1659,16 @@ def test_clamping_keeps_a_bitrate_inside_what_the_server_may_pull():
     assert clamp_bitrate(4_000_000, ceiling=8_000_000) == 4_000_000
 
 
+def test_a_deployment_that_never_set_a_ceiling_still_offers_the_quality_ladder():
+    # The host's menu is cut down to the ceiling, so a default below the top of
+    # the ladder silently hides those steps -- 10 and 12 Mbps were unselectable
+    # while this defaulted to 8 Mbps.
+    assert JellyfinConfig.from_payload({}).max_bitrate == 12_000_000
+    assert JellyfinConfig.from_payload({"enabled": True}).max_bitrate == 12_000_000
+    # Still a ceiling: a deployment that lowers it keeps the menu below it.
+    assert JellyfinConfig.from_payload({"max_bitrate": 4_000_000}).max_bitrate == 4_000_000
+
+
 def test_a_room_starts_below_the_servers_ceiling(monkeypatch):
     with _client(monkeypatch) as client:
         _fake(client)
