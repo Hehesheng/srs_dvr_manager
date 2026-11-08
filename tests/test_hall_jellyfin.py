@@ -16,6 +16,7 @@ from hall.jellyfin import (
     clamp_bitrate,
     clean_vtt,
     playback_mode,
+    segment_item_offset,
     subtitle_streams,
 )
 from hall.manager import HallConfig, HallManager, JellyfinConfig
@@ -436,6 +437,71 @@ def test_playlist_lists_the_whole_movie_so_a_member_can_be_seeked_into_it():
     assert "#EXTINF:3.003," in text
     # Every segment stays addressable for the life of the transcode.
     assert len(hls.segments) == 150
+
+
+def test_a_restarted_transcode_still_starts_at_the_item_start():
+    """The item time a Jellyfin transcode playlist begins at is not the seek.
+
+    Jellyfin answers a resumed transcode with the whole item, numbered from
+    its own start -- verified against the live server, where asking for 300s
+    returns a byte-identical first segment.  Publishing the seek position as
+    the players' clock offset is what used to restart the picture at 0 while
+    the progress bar sat at 300s.
+    """
+    # runtimeTicks is the item-scale position each segment was cut from.
+    assert segment_item_offset("http://j/live.m3u8?runtimeTicks=0&x=1") == 0.0
+    assert segment_item_offset("http://j/live.m3u8?runtimeTicks=3000000000") == 300.0
+    assert segment_item_offset("http://j/live.m3u8?other=1") is None
+    assert segment_item_offset("http://j/live.m3u8?runtimeTicks=nonsense") is None
+
+    class Resumed(FakeJellyfinClient):
+        async def _json(self, method, path, session=None, **kwargs):
+            return (
+                "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                "#EXT-X-PLAYLIST-TYPE:VOD\n"
+                "#EXTINF:6.006,\nseg.ts?runtimeTicks=0\n"
+                "#EXTINF:6.006,\nseg.ts?runtimeTicks=60000000\n"
+                "#EXT-X-ENDLIST\n"
+            )
+
+    client = Resumed()
+    hls = HlsSession(
+        item_id="x",
+        media_source_id="ms-1",
+        play_session_id="ps-1",
+        live_url="http://jelly.invalid/videos/x/live.m3u8",
+        start_seconds=300.0,
+    )
+    session = JellyfinSession(token="t", user_id="u", user_name="n", device_id="d")
+    text = asyncio.run(client.render_playlist(session, hls, lambda index: f"SEG{index}"))
+
+    assert hls.offset_seconds == 0.0
+    # Where the room wants playback to open, relative to this playlist's own
+    # first segment: the engines we do not drive read it from here.
+    assert "#EXT-X-START:TIME-OFFSET:300.000,PRECISE=YES" in text
+    # The published list is the item, so the offset the players keep is 0.
+    assert "#EXT-X-MEDIA-SEQUENCE:0" in text
+
+
+def test_a_playlist_that_starts_at_the_item_does_not_ask_the_players_to_jump():
+    """No seek, no start hint: the stream opens where it begins."""
+    class FromTheStart(FakeJellyfinClient):
+        async def _json(self, method, path, session=None, **kwargs):
+            return LIVE_TEXT
+
+    client = FromTheStart()
+    hls = HlsSession(
+        item_id="x",
+        media_source_id="ms-1",
+        play_session_id="ps-1",
+        live_url="http://jelly.invalid/videos/x/live.m3u8",
+        start_seconds=0.0,
+    )
+    session = JellyfinSession(token="t", user_id="u", user_name="n", device_id="d")
+    text = asyncio.run(client.render_playlist(session, hls, lambda index: f"SEG{index}"))
+    assert "EXT-X-START" not in text
+    assert hls.offset_seconds == 0.0
+    assert hls.public() == {"epoch": 0, "start_seconds": 0.0, "offset_seconds": 0.0}
 
 
 def test_a_listed_segment_that_is_not_written_yet_is_waited_for():
@@ -990,8 +1056,11 @@ def test_jellyfin_seek_restarts_the_transcode(monkeypatch):
         new_url = info["media_url"]
         assert new_url != old_url
         assert "epoch=2" in new_url
-        # The player needs to know where in the item the new stream starts.
-        assert info["media_start"] == 1800.0
+        # The player needs to know where in the item to pick the item up: the
+        # new stream itself still begins at the item's first segment, which is
+        # what the clock offset keeps.
+        assert info["media_resume"] == 1800.0
+        assert info["media_start"] == 0.0
 
         # The restart began halfway through, and the previous encoder stopped.
         assert fake.opened[-1] == ("/Items/hls-1/PlaybackInfo", 1800 * 10_000_000)
@@ -1056,7 +1125,8 @@ def test_host_picks_the_burned_in_subtitle_and_everyone_follows(monkeypatch):
         assert info["media_epoch"] == 2, "picking a subtitle must restart the transcode"
         assert info["jellyfin_subtitle"] == 3
         assert info["jellyfin_subtitles_off"] is False
-        assert info["media_start"] == 600.0
+        assert info["media_resume"] == 600.0
+        assert info["media_start"] == 0.0
         assert fake.opened[-1] == ("/Items/hls-1/PlaybackInfo", 600 * 10_000_000)
         assert fake.stopped, "the previous transcoding session was left running"
 
@@ -1265,7 +1335,8 @@ def test_the_host_can_lower_the_quality_and_everyone_follows(monkeypatch):
         # like a seek, so members are pulled onto the new stream.
         info = _wait_epoch(client, room, 2)
         assert info["media_epoch"] == 2
-        assert info["media_start"] == 120.0
+        assert info["media_resume"] == 120.0
+        assert info["media_start"] == 0.0
         assert info["jellyfin_bitrate"] == 4_000_000
         assert fake.opened[-1] == ("/Items/hls-1/PlaybackInfo", 120 * 10_000_000)
         assert fake.profiles[-1]["MaxStreamingBitrate"] == 4_000_000

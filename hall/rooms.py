@@ -413,7 +413,22 @@ class Room:
 
     @property
     def media_start(self) -> float:
-        """Where in the item the current transcode begins, in seconds."""
+        """Where in the item the current stream's first segment sits.
+
+        Jellyfin hands out a whole-item playlist whatever position it was
+        asked to resume from, so this is 0 -- and this, not the seek target,
+        is the offset the players add to their element clock.
+        """
+        return float(self.hls.offset_seconds) if self.hls is not None else 0.0
+
+    @property
+    def media_resume(self) -> float:
+        """The item time the room asked the transcode to start at.
+
+        The players jump here once the new stream is attached; without it a
+        seek would restart the picture at the item's first segment while the
+        progress bar stayed where the host left it.
+        """
         return float(self.hls.start_seconds) if self.hls is not None else 0.0
 
     def media_url(self) -> Optional[str]:
@@ -436,6 +451,7 @@ class Room:
             "media_url": self.media_url(),
             "media_epoch": self.media_epoch,
             "media_start": round(self.media_start, 3),
+            "media_resume": round(self.media_resume, 3),
             "playlist": self.playlist_public(),
             "host": self.host_snapshot(),
             "members": [m.public() for m in self.members.values()],
@@ -474,6 +490,7 @@ class Room:
             "media_url": self.media_url(),
             "media_epoch": self.media_epoch,
             "media_start": round(self.media_start, 3),
+            "media_resume": round(self.media_resume, 3),
             "playlist": self.playlist_public(),
             "host": self.host_snapshot(),
             "member_count": self.member_count(),

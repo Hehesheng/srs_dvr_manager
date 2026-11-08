@@ -119,12 +119,53 @@ class HlsSession:
     target_duration: float = 3.0
     segments: Dict[int, str] = field(default_factory=dict)
     durations: Dict[int, float] = field(default_factory=dict)
+    # Item time of each listed segment, read from its ``runtimeTicks``.
+    offsets: Dict[int, float] = field(default_factory=dict)
     complete: bool = False
     refreshed_at: float = 0.0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
+    @property
+    def offset_seconds(self) -> float:
+        """Where the first segment we publish sits in the item.
+
+        Jellyfin numbers a transcode playlist from the *item's* start even
+        when the transcode was asked to begin at 300s: its segment URLs carry
+        the ``runtimeTicks`` each one was cut from, and the first of them is
+        still the item's own 0.  So this is what the players keep as their
+        clock offset -- ``start_seconds`` is where the room wants playback to
+        begin, which is a different thing and only equals this one at 0.
+        """
+        if not self.segments:
+            return 0.0
+        return self.offsets.get(min(self.segments), 0.0)
+
     def public(self) -> Dict[str, Any]:
-        return {"epoch": self.epoch, "start_seconds": round(self.start_seconds, 3)}
+        return {
+            "epoch": self.epoch,
+            "start_seconds": round(self.start_seconds, 3),
+            "offset_seconds": round(self.offset_seconds, 3),
+        }
+
+
+def segment_item_offset(url: str) -> Optional[float]:
+    """The item time a Jellyfin transcode segment was cut from, in seconds.
+
+    ``None`` when the URL carries no ``runtimeTicks`` (a plain media playlist
+    or an unexpected shape), which the caller reads as "no better answer than
+    0.0", the item start.
+    """
+    try:
+        query = dict(parse_qsl(urlparse(url).query))
+    except ValueError:
+        return None
+    raw = query.get("runtimeTicks")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw) / 10_000_000)
+    except ValueError:
+        return None
 
 
 def _strip_override_tags(text: str) -> str:
@@ -908,6 +949,9 @@ class JellyfinClient:
                     index = sequence
                 hls.segments[index] = urljoin(hls.live_url, stripped)
                 hls.durations[index] = max(0.1, duration)
+                offset = segment_item_offset(hls.segments[index])
+                if offset is not None:
+                    hls.offsets[index] = offset
                 index += 1
             hls.target_duration = max(1.0, float(target))
             hls.refreshed_at = time.time()
@@ -918,9 +962,9 @@ class JellyfinClient:
 
         The list is published as VOD: every segment of this transcode already
         has its final number, so the browser can jump anywhere inside it and a
-        member can be seeked straight to where the host is.  Segment 0 is
-        ``start_seconds`` into the item, which is exactly the offset the
-        players keep in ``media_start``.
+        member can be seeked straight to where the host is.  Its first entry
+        sits at ``offset_seconds`` into the item -- the item start, whatever
+        position the transcode was asked to resume from.
         """
         await self.refresh_playlist(session, hls)
         indices = sorted(hls.segments)
@@ -930,6 +974,12 @@ class JellyfinClient:
         lines.append("#EXT-X-VERSION:3")
         lines.append(f"#EXT-X-TARGETDURATION:{int(round(hls.target_duration))}")
         lines.append(f"#EXT-X-MEDIA-SEQUENCE:{indices[0] if indices else 0}")
+        # Where in *this playlist* the room wants playback to begin.  hls.js
+        # takes its own startPosition over this, so it is the engine we do not
+        # drive (native HLS) that reads it and opens at the right place.
+        start_at = hls.start_seconds - hls.offset_seconds
+        if start_at > 0.5:
+            lines.append(f"#EXT-X-START:TIME-OFFSET:{start_at:.3f},PRECISE=YES")
         for index in indices:
             lines.append(f"#EXTINF:{hls.durations.get(index, hls.target_duration):.3f},")
             lines.append(rewrite(index))
