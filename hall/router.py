@@ -71,6 +71,15 @@ class CreateRoomRequest(BaseModel):
     name: str = Field(default="Media Room", max_length=64)
     # Optional: a host may open the room first and fill the playlist later.
     media: Optional[MediaPayload] = None
+    # What the host is called in the member list.  The browser remembers it and
+    # sends it along, so a new room opens under the same name as the last one.
+    host_name: str = Field(default="", max_length=64)
+
+
+class HostNameRequest(BaseModel):
+    # Empty is allowed and means "no custom name"; the cap is enforced in the
+    # manager so the message can say what the limit is.
+    name: str = Field(default="", max_length=64)
 
 
 class JoinRequest(BaseModel):
@@ -118,7 +127,7 @@ async def create_room(payload: CreateRoomRequest, request: Request):
         return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
     media_payload = payload.media.model_dump(exclude_none=True) if payload.media else None
     try:
-        room = await hall.create_room(payload.name, media_payload)
+        room = await hall.create_room(payload.name, media_payload, payload.host_name)
     except HallError as exc:
         return _hall_error(exc)
     return {
@@ -256,6 +265,32 @@ async def join_room(room_ref: str, payload: JoinRequest, request: Request):
         "ws_url": f"/hall/ws/{room.room_id}",
         "room": room.public_info(),
     }
+
+
+@router.post("/api/rooms/{room_ref}/host_name")
+async def set_host_name(
+    room_ref: str,
+    payload: HostNameRequest,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    """Set the name the host appears under in the member list (host only).
+
+    Members pick their own name when they join; the host has no join form, so
+    this is where theirs comes from.  Everyone sees the same name, which is why
+    it is room state rather than something each browser keeps to itself.
+    """
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        name = await hall.set_host_name(room, x_host_token or "", payload.name)
+    except HallError as exc:
+        return _hall_error(exc)
+    return {"code": 0, "host_name": name}
 
 
 @router.post("/api/rooms/{room_ref}/jellyfin/session")

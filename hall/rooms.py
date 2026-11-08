@@ -96,6 +96,10 @@ class Room:
         self.room_id = "r_" + secrets.token_hex(8)
         self.room_code = hall.auth.new_room_code()
         self.name = name
+        # What the host wants to be called in the member list.  Empty means
+        # the default label ("房主"); the frontend decides the wording, so the
+        # server never invents a name of its own here.
+        self.host_name = ""
         # A room may be created before the host picks anything to play.
         self.media = media
         self.playlist: Dict[str, MediaInfo] = {}
@@ -446,6 +450,7 @@ class Room:
             "room_id": self.room_id,
             "room_code": self.room_code,
             "name": self.name,
+            "host_name": self.host_name,
             "server_ts": round(_wall_ms(), 3),
             "media": self.media.public() if self.media else None,
             "media_url": self.media_url(),
@@ -485,6 +490,7 @@ class Room:
             "room_id": self.room_id,
             "room_code": self.room_code,
             "name": self.name,
+            "host_name": self.host_name,
             "ended": self.ended,
             "media": self.media.public() if self.media else None,
             "media_url": self.media_url(),

@@ -69,6 +69,24 @@ MAX_PLAYLIST_ITEMS = 100
 # hear about changes, so any silence (seek, pause, stale tab) would leave them
 # extrapolating from an old anchor.
 HOST_PULSE_INTERVAL = 1.0
+# The name the host shows up under in the member list.  Same length as a member
+# name, so the two read the same in the list.
+HOST_NAME_MAX = 32
+
+
+def clean_host_name(raw: Any) -> str:
+    """Tidy a host's own name: one line, no stray spaces, inside the cap.
+
+    A name is drawn next to a member's in one narrow list, so a newline or a
+    run of spaces is a layout accident, not something to preserve.  Empty is a
+    legitimate value: it means "call me 房主".
+    """
+    text = " ".join(str(raw or "").split())
+    if len(text) > HOST_NAME_MAX:
+        raise HallError(
+            f"名字最多 {HOST_NAME_MAX} 个字", protocol.ERR_HOST_NAME_INVALID, 400
+        )
+    return text
 
 
 class HallError(Exception):
@@ -307,7 +325,10 @@ class HallManager:
 
     # -- creation / join ----------------------------------------------
     async def create_room(
-        self, name: str, media_payload: Optional[Dict[str, Any]] = None
+        self,
+        name: str,
+        media_payload: Optional[Dict[str, Any]] = None,
+        host_name: str = "",
     ) -> Room:
         if not self.enabled:
             raise HallError("hall is disabled")
@@ -333,6 +354,10 @@ class HallManager:
             jellyfin_source=built.jellyfin_source if built else None,
             hls=built.hls if built else None,
         )
+        # A name the host set before is carried in by the browser, so the
+        # member list says the same thing without the host having to re-enter
+        # it in every room.
+        room.host_name = clean_host_name(host_name)
         while room.room_code in self._codes:
             room.room_code = self.auth.new_room_code()
         # Quality starts at the room default, never above what this server was
@@ -1104,6 +1129,19 @@ class HallManager:
         )
         return room
 
+    async def set_host_name(self, room: Room, host_token: str, name: str) -> str:
+        """Set (or clear) the name the host shows up under.
+
+        Members name themselves when they join; this is the host's own, and it
+        belongs to the room rather than to a connection, so everyone sees the
+        same thing and it survives the host's worker reconnecting.
+        """
+        self._require_host(room, host_token)
+        room.host_name = clean_host_name(name)
+        room.touch()
+        await self.broadcast_room(room)
+        return room.host_name
+
     async def join_room(self, ref: str, member_name: str) -> Member:
         room = self.require_room(ref)
         if room.member_count() >= self.config.max_members_per_room:
@@ -1303,6 +1341,7 @@ class HallManager:
                 "type": payload_type,
                 "server_ts": round(time.time() * 1000.0, 3),
                 "host": host,
+                "host_name": room.host_name,
                 "members": [m.public() for m in room.members.values()],
             },
         )

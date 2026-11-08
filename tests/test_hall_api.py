@@ -199,3 +199,86 @@ def test_host_can_change_media(monkeypatch):
             headers={"X-Host-Token": room["host_token"]},
         )
         assert ended.status_code == 410
+
+
+def test_host_name_is_shown_to_members(monkeypatch):
+    with _client(monkeypatch) as client:
+        room = client.post(
+            "/hall/api/rooms",
+            json={"name": "test room", "host_name": "  客厅  的  电视  "},
+        ).json()
+        # The browser remembers the name and hands it in at creation, so a new
+        # room opens already labelled -- and tidied up on the way in.
+        assert room["room"]["host_name"] == "客厅 的 电视"
+
+        member = client.post(
+            f"/hall/api/rooms/{room['room_code']}/join", json={"name": "alice"}
+        ).json()
+        info = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        assert info["host_name"] == "客厅 的 电视"
+
+        with client.websocket_connect(f"/hall/ws/{room['room_id']}") as ws:
+            ws.send_json(
+                {"type": "auth", "role": "member", "token": member["member_token"]}
+            )
+            assert ws.receive_json()["type"] == "auth_ok"
+
+            # A member may not rename the host, and neither may a stray token.
+            denied = client.post(
+                f"/hall/api/rooms/{room['room_code']}/host_name",
+                json={"name": "我说了算"},
+                headers={"X-Host-Token": member["member_token"]},
+            )
+            assert denied.status_code == 403
+
+            renamed = client.post(
+                f"/hall/api/rooms/{room['room_code']}/host_name",
+                json={"name": "书房"},
+                headers={"X-Host-Token": room["host_token"]},
+            )
+            assert renamed.status_code == 200, renamed.text
+            assert renamed.json()["host_name"] == "书房"
+
+            # Members see it without asking: the room state carries the name.
+            seen = None
+            for _ in range(10):
+                message = ws.receive_json()
+                if message.get("type") == "room_state" and message.get("host_name") == "书房":
+                    seen = message
+                    break
+            assert seen is not None
+
+            # Empty is a real choice: it means "call me 房主" again.
+            cleared = client.post(
+                f"/hall/api/rooms/{room['room_code']}/host_name",
+                json={"name": "   "},
+                headers={"X-Host-Token": room["host_token"]},
+            )
+            assert cleared.status_code == 200
+            assert cleared.json()["host_name"] == ""
+
+        assert client.get(f"/hall/api/rooms/{room['room_code']}").json()["host_name"] == ""
+
+
+def test_host_name_length_is_capped(monkeypatch):
+    with _client(monkeypatch) as client:
+        room = _create_room(client)
+
+        too_long = client.post(
+            f"/hall/api/rooms/{room['room_code']}/host_name",
+            json={"name": "房" * 33},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert too_long.status_code == 400
+        assert too_long.json()["code"] == "HOST_NAME_INVALID"
+
+        # The rejected value must not have landed on the room.
+        assert client.get(f"/hall/api/rooms/{room['room_code']}").json()["host_name"] == ""
+
+        at_cap = client.post(
+            f"/hall/api/rooms/{room['room_code']}/host_name",
+            json={"name": "房" * 32},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert at_cap.status_code == 200
+        assert at_cap.json()["host_name"] == "房" * 32
