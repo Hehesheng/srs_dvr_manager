@@ -464,11 +464,23 @@ class JellyfinClient:
 
     # -- plumbing ------------------------------------------------------
     def _headers(self, token: Optional[str], device_id: str) -> Dict[str, str]:
-        authorization = (
-            f'MediaBrowser Client="{CLIENT_NAME}", Device="{DEVICE_NAME}", '
-            f'DeviceId="{device_id or "srs-hall"}", Version="{CLIENT_VERSION}"'
-        )
-        headers = {"Authorization": authorization, "Accept": "application/json"}
+        # The key has to ride in the MediaBrowser header: Jellyfin 12 dropped
+        # X-Emby-Token and answers 401 on every authenticated call without it,
+        # which is what made a perfectly good key look wrong on a 12.1 server.
+        # Older servers (10.x) read the same header, so one form covers both;
+        # X-Emby-Token stays for anything older still that only knows that one.
+        fields = [
+            f'Client="{CLIENT_NAME}"',
+            f'Device="{DEVICE_NAME}"',
+            f'DeviceId="{device_id or "srs-hall"}"',
+            f'Version="{CLIENT_VERSION}"',
+        ]
+        if token:
+            fields.append(f'Token="{token}"')
+        headers = {
+            "Authorization": "MediaBrowser " + ", ".join(fields),
+            "Accept": "application/json",
+        }
         if token:
             headers["X-Emby-Token"] = token
         return headers

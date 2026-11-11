@@ -346,6 +346,25 @@ def test_a_legacy_config_with_only_a_url_still_counts_as_enabled():
     )
 
 
+def test_the_key_travels_in_the_authorization_header():
+    # Jellyfin 12 ignores X-Emby-Token and answers 401 on every authenticated
+    # call, so a key that looked fine on 10.x read as invalid on 12.1.  10.x
+    # accepts the token in the MediaBrowser header too: one form covers both.
+    client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
+    headers = client._headers("abc123", "dev-1")
+    assert headers["Authorization"] == (
+        'MediaBrowser Client="SRS Media Hall", Device="SRS Media Hall", '
+        'DeviceId="dev-1", Version="1.0.0", Token="abc123"'
+    )
+    # Kept for servers that only ever learned this one.
+    assert headers["X-Emby-Token"] == "abc123"
+    # No key, no token field -- the header still has to be a valid one.
+    anonymous = client._headers(None, "dev-1")
+    assert "Token=" not in anonymous["Authorization"]
+    assert anonymous["Authorization"].startswith("MediaBrowser Client=")
+    assert "X-Emby-Token" not in anonymous
+
+
 def test_the_account_a_key_belongs_to_is_picked_from_the_server():
     client = JellyfinClient(None, "http://jelly.invalid", 8_000_000)
     users = [
