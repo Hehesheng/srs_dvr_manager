@@ -44,11 +44,18 @@ class JellyfinConnectRequest(BaseModel):
     Jellyfin server is configured on the server side.  ``user_id`` is optional
     and only a hint -- it is what the browser remembered from last time, and
     the server falls back to asking Jellyfin which account the key belongs to.
+
+    ``token`` is an API key made in the Jellyfin console; ``username`` and
+    ``password`` are the other way in, traded for an access token on this one
+    request.  Either pair works, and the password goes no further than the
+    call that checks it.
     """
 
     url: str = Field(default="", max_length=512)
     token: str = Field(default="", max_length=512)
     user_id: Optional[str] = Field(default=None, max_length=64)
+    username: str = Field(default="", max_length=128)
+    password: str = Field(default="", max_length=512)
 
 
 class HlsSeekRequest(BaseModel):
@@ -302,10 +309,10 @@ async def jellyfin_session(
 ):
     """Connect the room to the Jellyfin server the host typed in.
 
-    The address and the API key both come from the browser and stay on the
+    The address and the credentials both come from the browser and stay on the
     room for as long as it lives; the server keeps no Jellyfin configuration
-    of its own.  The key is never echoed back -- the browser already has it,
-    and every other endpoint stays free of it.
+    of its own.  A password is used for this one call only -- what the room
+    keeps is the token Jellyfin handed back.
     """
     hall = _hall(request)
     if hall is None:
@@ -313,11 +320,11 @@ async def jellyfin_session(
     room = hall.get_room(room_ref)
     if room is None:
         return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
-    if not payload.url.strip() or not payload.token.strip():
+    if not payload.url.strip() or not (payload.token.strip() or payload.password):
         return _error_json(
             status.HTTP_400_BAD_REQUEST,
             protocol.ERR_JELLYFIN_CONFIG_REQUIRED,
-            "请填写 Jellyfin 网址和密钥",
+            "请填写 Jellyfin 网址，以及密钥或用户名密码",
         )
     try:
         session = await hall.jellyfin_connect(
@@ -326,14 +333,26 @@ async def jellyfin_session(
             payload.url,
             payload.token,
             payload.user_id,
+            username=payload.username,
+            password=payload.password,
         )
         libraries = await hall.jellyfin_libraries(room)
     except HallError as exc:
         return _hall_error(exc)
     # The address comes back the way the server settled on it (a bare host
     # gained https://), so the browser can store and show exactly what is in
-    # use.  The key does not: the browser sent it.
-    return {"jellyfin": session.public(), "libraries": libraries, "url": session.base_url}
+    # use.  An API key does not come back: the browser sent it, and the answer
+    # carries no token at all.  A token that came out of a password login does,
+    # because the browser has never seen it and remembering it is what spares
+    # the host the password next time.
+    body: Dict[str, Any] = {
+        "jellyfin": session.public(),
+        "libraries": libraries,
+        "url": session.base_url,
+    }
+    if payload.password:
+        body["token"] = session.token
+    return body
 
 
 @router.get("/api/rooms/{room_ref}/jellyfin/items")

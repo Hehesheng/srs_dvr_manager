@@ -85,6 +85,10 @@ SEGMENT_TRY_LIMIT = 5
 class JellyfinError(Exception):
     status_code = 502
     code = "JELLYFIN_UNAVAILABLE"
+    # What Jellyfin itself answered, when the error came from a response.
+    # Kept apart from ``status_code`` (what the hall API returns), so callers
+    # can tell "Jellyfin said 400" from "we say 502".
+    upstream_status: Optional[int] = None
 
     def __init__(self, message: str, code: Optional[str] = None, status_code: Optional[int] = None):
         super().__init__(message)
@@ -517,9 +521,11 @@ class JellyfinClient:
                     raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
                 if response.status >= 400:
                     detail = (await response.text())[:200]
-                    raise JellyfinError(
+                    error = JellyfinError(
                         f"Jellyfin 返回 HTTP {response.status}: {detail}", "JELLYFIN_UNAVAILABLE"
                     )
+                    error.upstream_status = response.status
+                    raise error
                 if response.content_type == "application/json":
                     return await response.json(content_type=None)
                 return await response.text()
@@ -560,6 +566,51 @@ class JellyfinClient:
             token=token,
             user_id=str(payload.get("Id") or ""),
             user_name=str(payload.get("Name") or ""),
+            device_id=device_id,
+            base_url=self.base_url,
+        )
+
+    async def authenticate(
+        self, username: str, password: str, device_id: str
+    ) -> JellyfinSession:
+        """Trade a username and password for a token the room can play with.
+
+        Jellyfin answers with an access token tied to that account and that
+        device.  From here on it is just a token, so browsing, transcoding and
+        subtitles run on exactly the code an API key runs on -- there is no
+        second playback path.  The password is used for this one call and is
+        never kept, logged or sent back to the browser.
+        """
+        # The device id has to match the one later calls present, or Jellyfin
+        # will not recognise its own transcoding session when we stop it.
+        probe = JellyfinSession(
+            token="", user_id="", user_name="", device_id=device_id,
+            base_url=self.base_url,
+        )
+        try:
+            payload = await self._json(
+                "POST",
+                "/Users/AuthenticateByName",
+                probe,
+                body={"Username": username, "Pw": password},
+            )
+        except JellyfinError as exc:
+            # Jellyfin answers a bad login with 401 on 10.x and 400 on 12.x:
+            # both are about the two fields just typed, not about a token that
+            # went stale.  Anything else (timeout, unreachable host) keeps its
+            # own message -- calling a dead server "wrong password" would send
+            # the host hunting in the Jellyfin console for nothing.
+            if isinstance(exc, JellyfinAuthError) or exc.upstream_status in (400, 401, 403):
+                raise JellyfinAuthError("用户名或密码不对")
+            raise
+        user = (payload or {}).get("User") or {}
+        token = str((payload or {}).get("AccessToken") or "").strip()
+        if not token or not user.get("Id"):
+            raise JellyfinAuthError("Jellyfin 没有返回登录令牌，请改用 API 密钥连接")
+        return JellyfinSession(
+            token=token,
+            user_id=str(user.get("Id") or ""),
+            user_name=str(user.get("Name") or ""),
             device_id=device_id,
             base_url=self.base_url,
         )

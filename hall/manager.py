@@ -675,15 +675,19 @@ class HallManager:
         room: Room,
         host_token: str,
         url: str,
-        token: str,
+        token: str = "",
         user_id: Optional[str] = None,
+        username: str = "",
+        password: str = "",
     ) -> JellyfinSession:
-        """Adopt the server and API key the host typed into the browser.
+        """Adopt the server the host typed into the browser.
 
-        The address is checked here rather than on the first library call, so
-        a typo comes back as a message about the address.  Connecting again
-        replaces whatever this room had before, which is what "换一个服务器"
-        does.
+        Two ways in, both ending in the same kind of session: an API key the
+        host made in the Jellyfin console, or a username and password we trade
+        for an access token.  The address is checked here rather than on the
+        first library call, so a typo comes back as a message about the
+        address.  Connecting again replaces whatever this room had before,
+        which is what "换一个服务器" does.
         """
         self._require_host(room, host_token)
         self._require_jellyfin_enabled()
@@ -692,23 +696,43 @@ class HallManager:
         except JellyfinError as exc:
             raise HallError(exc.message, exc.code, exc.status_code)
         token = str(token or "").strip()
-        if not token:
+        username = str(username or "").strip()
+        password = str(password or "")
+        if password and not username:
             raise HallError(
-                "请填写 Jellyfin 密钥", protocol.ERR_JELLYFIN_CONFIG_REQUIRED, 400
+                "请填写 Jellyfin 用户名", protocol.ERR_JELLYFIN_CONFIG_REQUIRED, 400
+            )
+        if not token and not password:
+            raise HallError(
+                "请填写 Jellyfin 密钥，或用户名和密码",
+                protocol.ERR_JELLYFIN_CONFIG_REQUIRED,
+                400,
             )
         if len(token) > 512:
             raise HallError(
                 "Jellyfin 密钥太长了", protocol.ERR_JELLYFIN_CONFIG_REQUIRED, 400
             )
+        if len(username) > 128 or len(password) > 512:
+            raise HallError(
+                "用户名或密码太长了", protocol.ERR_JELLYFIN_CONFIG_REQUIRED, 400
+            )
         probe = JellyfinSession(
             token=token, user_id="", user_name="", device_id="", base_url=base_url
         )
         client = self.jellyfin_for(probe)
+        device_id = f"srs-hall-{room.room_id}"
         try:
-            session = await client.verify(
-                token, f"srs-hall-{room.room_id}", user_id
-            )
-        except JellyfinAuthError:
+            if password:
+                session = await client.authenticate(username, password, device_id)
+            else:
+                session = await client.verify(token, device_id, user_id)
+        except JellyfinAuthError as exc:
+            if password:
+                raise HallError(
+                    exc.message or "用户名或密码不对",
+                    protocol.ERR_JELLYFIN_AUTH_FAILED,
+                    401,
+                )
             # "认证已失效" would be the wrong story here: this is the first
             # use of a key the host just typed.
             raise HallError(
@@ -721,10 +745,11 @@ class HallManager:
         room.jellyfin = session
         room.touch()
         logger.info(
-            "Jellyfin connected room=%s server=%s user=%s",
+            "Jellyfin connected room=%s server=%s user=%s via=%s",
             room.room_id,
             base_url,
             session.user_name,
+            "password" if password else "key",
         )
         return session
 

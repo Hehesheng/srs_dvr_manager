@@ -40,6 +40,9 @@ class FakeRecordManager:
 # The API key every test connects with, and the address it belongs to.
 TEST_KEY = "test-key-not-a-real-one"
 TEST_URL = "http://jelly.invalid"
+# What the fake server hands back for the one password it knows.
+LOGIN_TOKEN = "login-token-not-a-real-one"
+LOGIN_PASSWORD = "correct-horse"
 
 MASTER_TEXT = """#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=6192000,CODECS="avc1.424029,mp4a.40.2",RESOLUTION=1280x720
@@ -69,12 +72,28 @@ class FakeJellyfinClient(JellyfinClient):
         self.profiles = []
         self.subtitle_calls = []
         self.item_calls = []
+        # 10.x answers a bad login with 401, 12.x with 400; default to 10.x.
+        self.login_status = 401
         # A test can hold a restart open to land a second seek while it runs.
         self.hold_next = threading.Event()
         self.held = threading.Event()
         self.release = threading.Event()
 
     async def _json(self, method, path, session=None, *, params=None, body=None, timeout=20.0):
+        if method == "POST" and path.endswith("/Users/AuthenticateByName"):
+            # The real client only gets here for a username and password.
+            self.logins = getattr(self, "logins", [])
+            self.logins.append(((body or {}).get("Username"), bool((body or {}).get("Pw"))))
+            if (body or {}).get("Username") != "hehesheng" or (body or {}).get("Pw") != LOGIN_PASSWORD:
+                if self.login_status == 400:
+                    error = JellyfinError(
+                        "Jellyfin 返回 HTTP 400: Error processing request.",
+                        "JELLYFIN_UNAVAILABLE",
+                    )
+                    error.upstream_status = 400
+                    raise error
+                raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
+            return {"AccessToken": LOGIN_TOKEN, "User": {"Id": "user-1", "Name": "hehesheng"}}
         if method == "POST" and path.endswith("/PlaybackInfo"):
             if self.hold_next.is_set():
                 self.hold_next.clear()
@@ -106,7 +125,7 @@ class FakeJellyfinClient(JellyfinClient):
         return {}
 
     async def verify(self, token, device_id, user_id=None):
-        if token != TEST_KEY:
+        if token not in (TEST_KEY, LOGIN_TOKEN):
             raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
         if user_id and user_id != "user-1":
             raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
@@ -363,6 +382,84 @@ def test_the_key_travels_in_the_authorization_header():
     assert "Token=" not in anonymous["Authorization"]
     assert anonymous["Authorization"].startswith("MediaBrowser Client=")
     assert "X-Emby-Token" not in anonymous
+
+
+# -- signing in with a password ----------------------------------------
+
+
+def _connect(client, room, **payload):
+    return client.post(
+        f"/hall/api/rooms/{room['room_code']}/jellyfin/session",
+        json={"url": TEST_URL, **payload},
+        headers={"X-Host-Token": room["host_token"]},
+    )
+
+
+def test_a_password_login_hands_back_a_token_the_browser_can_keep(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        reply = _connect(client, room, username="hehesheng", password=LOGIN_PASSWORD)
+        assert reply.status_code == 200, reply.text
+        body = reply.json()
+        assert body["jellyfin"] == {"user_name": "hehesheng", "user_id": "user-1"}
+        # The browser has never seen this token; keeping it is what saves the
+        # host typing the password on the next visit.
+        assert body["token"] == LOGIN_TOKEN
+        # The password stops at the login call.
+        assert LOGIN_PASSWORD not in reply.text
+        # The room is signed in as that account, with the token Jellyfin gave.
+        state = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        assert state["jellyfin"]["user_name"] == "hehesheng"
+        assert LOGIN_PASSWORD not in client.get(f"/hall/api/rooms/{room['room_code']}").text
+        room_state = _hall(client).rooms[room["room_id"]]
+        assert room_state.jellyfin.token == LOGIN_TOKEN
+        # No password was ever written down on the room.
+        assert not hasattr(room_state, "jellyfin_password")
+        assert fake.logins == [("hehesheng", True)]
+
+        # That token connects the room again on its own.
+        again = _connect(client, room, token=body["token"], user_id="user-1")
+        assert again.status_code == 200, again.text
+        # ... and an API key is still not echoed back.
+        assert "token" not in again.json()
+        assert fake.logins == [("hehesheng", True)]
+
+
+def test_a_wrong_password_is_reported_as_such(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        reply = _connect(client, room, username="hehesheng", password="wrong")
+        assert reply.status_code == 401, reply.text
+        assert reply.json()["message"] == "用户名或密码不对"
+        # Nothing was adopted, so the room still has no Jellyfin session.
+        assert client.get(f"/hall/api/rooms/{room['room_code']}").json()["jellyfin"] is None
+
+
+def test_a_12x_server_answers_a_bad_login_with_400_and_still_reads_as_wrong_password(monkeypatch):
+    # Jellyfin 12.1 says 400 "Error processing request." for a bad login; the
+    # host should still read it as the two fields being wrong, not as the
+    # server being broken.
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        fake.login_status = 400
+        room = _create_room(client)
+        reply = _connect(client, room, username="hehesheng", password="wrong")
+        assert reply.status_code == 401, reply.text
+        assert reply.json()["message"] == "用户名或密码不对"
+
+
+def test_a_password_needs_a_username_and_a_way_in_is_required(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        only_password = _connect(client, room, password=LOGIN_PASSWORD)
+        assert only_password.status_code == 400
+        assert only_password.json()["message"] == "请填写 Jellyfin 用户名"
+        nothing = _connect(client, room)
+        assert nothing.status_code == 400
+        assert "密钥" in nothing.json()["message"]
 
 
 def test_the_account_a_key_belongs_to_is_picked_from_the_server():
