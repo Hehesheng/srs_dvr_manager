@@ -21,6 +21,7 @@ from .jellyfin import (
     JellyfinError,
     JellyfinSession,
     JellyfinSource,
+    audio_streams,
     clamp_bitrate,
     DEFAULT_TRANSCODE_BITRATE,
     direct_mime,
@@ -549,6 +550,18 @@ class HallManager:
         )
         room.jellyfin_subtitle = None
         room.jellyfin_subtitles_off = False
+        # Audio can only be swapped through the transcode, so one track is not
+        # worth a menu.  Direct play keeps the file's own default until the
+        # host picks something else (which turns the item into a transcode).
+        tracks = audio_streams(source)
+        room.jellyfin_audio_tracks = tracks if len(tracks) > 1 else []
+        # Jellyfin names the track it picked in the transcode URL; direct play
+        # has no such answer, so the file's own default is the current one.
+        playing = built.hls.audio_index if built.hls is not None else None
+        room.jellyfin_audio = playing if playing is not None else next(
+            (track["index"] for track in tracks if track.get("is_default")),
+            tracks[0]["index"] if tracks else None,
+        )
 
     def _require_host(self, room: Room, host_token: str) -> None:
         if host_token != room.host_token:
@@ -902,6 +915,110 @@ class HallManager:
             task = asyncio.create_task(self._run_seek(room))
             self._seek_tasks[room.room_id] = task
 
+    async def set_transcode_audio(
+        self,
+        room: Room,
+        host_token: str,
+        choice: Any,
+        position: float,
+    ) -> None:
+        """Pick the audio track the room hears.
+
+        A browser cannot swap the audio track inside a file it already plays,
+        so an item that direct-plays is turned into a transcode the first time
+        the host picks a track (see ``_start_audio_transcode``).  Once the room
+        is on the transcode, changing tracks is the same restart a seek does,
+        which also publishes a new epoch for every member to follow.
+        """
+        self._require_host(room, host_token)
+        if room.media is None or room.media.kind != "jellyfin":
+            raise HallError("只有 Jellyfin 视频可以选择音轨", protocol.ERR_BAD_MESSAGE, 400)
+        if room.jellyfin is None:
+            raise HallError(
+                "Jellyfin 登录已失效，请重新登录",
+                protocol.ERR_JELLYFIN_AUTH_REQUIRED,
+                401,
+            )
+        if not isinstance(choice, int) or isinstance(choice, bool) or choice < 0:
+            raise HallError("音轨选择不正确", protocol.ERR_BAD_MESSAGE, 400)
+        index = int(choice)
+        known = {
+            int(track["index"])
+            for track in room.jellyfin_audio_tracks
+            if isinstance(track.get("index"), int)
+        }
+        if not known:
+            raise HallError("这个视频没有可选的音轨", protocol.ERR_BAD_MESSAGE, 400)
+        if index not in known:
+            raise HallError("没有这条音轨", protocol.ERR_BAD_MESSAGE, 400)
+        target = max(0.0, float(position))
+        if room.media.playback_mode == "hls" and room.hls is not None:
+            if index == room.jellyfin_audio:
+                return
+            room.jellyfin_audio = index
+            room.pending_seek = target
+            task = self._seek_tasks.get(room.room_id)
+            if task is None or task.done():
+                task = asyncio.create_task(self._run_seek(room))
+                self._seek_tasks[room.room_id] = task
+            return
+        await self._start_audio_transcode(room, index, target)
+
+    async def _start_audio_transcode(
+        self, room: Room, index: int, position: float
+    ) -> None:
+        """Turn the direct-playing item into a transcode with ``index`` chosen."""
+        session = room.jellyfin
+        media = room.media
+        if session is None or media is None:
+            raise HallError("当前没有播放中的媒体", protocol.ERR_BAD_MESSAGE, 400)
+        client = self.jellyfin_for(session)
+        try:
+            hls = await client.open_transcode(
+                session,
+                media.item_id or "",
+                position,
+                room.media_epoch + 1,
+                audio_index=index,
+                max_bitrate=room.jellyfin_bitrate,
+            )
+        except JellyfinAuthError:
+            room.jellyfin = None
+            raise HallError(
+                "Jellyfin 登录已失效，请重新登录",
+                protocol.ERR_JELLYFIN_AUTH_REQUIRED,
+                401,
+            )
+        except JellyfinError as exc:
+            raise HallError(exc.message, exc.code, exc.status_code)
+        room.hls = hls
+        room.jellyfin_audio = hls.audio_index if hls.audio_index is not None else index
+        # The item keeps playing, but from now on out of the transcoder.
+        media.playback_mode = "hls"
+        media.mime = "application/vnd.apple.mpegurl"
+        media.size = 0
+        # Now that the picture is transcoded, Jellyfin burns subtitles in; the
+        # text tracks pulled for direct play would otherwise double up.
+        for subtitle_id in [
+            subtitle.subtitle_id
+            for subtitle in room.subtitles.values()
+            if subtitle.media_id == media.media_id
+        ]:
+            room.subtitles.pop(subtitle_id, None)
+        room.reset_inactive_subtitle()
+        room.jellyfin_subtitle_tracks = subtitle_streams(room.jellyfin_item or {})
+        room.jellyfin_subtitle = None
+        room.jellyfin_subtitles_off = False
+        # Cached segments belong to the direct stream that is now gone.
+        room.cache = BlockCache(room.cache.block_size, room.cache.max_bytes)
+        await self.broadcast_room(room)
+        logger.info(
+            "Jellyfin direct play turned into a transcode room=%s audio=%s epoch=%d",
+            room.room_id,
+            room.jellyfin_audio,
+            hls.epoch,
+        )
+
     async def _run_seek(self, room: Room) -> None:
         """Restart the transcode at the host's latest position.
 
@@ -949,6 +1066,7 @@ class HallManager:
                 old.epoch + 1,
                 subtitle_index=room.jellyfin_subtitle,
                 subtitles_off=room.jellyfin_subtitles_off,
+                audio_index=room.jellyfin_audio,
                 max_bitrate=room.jellyfin_bitrate,
             )
         except JellyfinAuthError:

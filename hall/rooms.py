@@ -141,6 +141,10 @@ class Room:
         # ``jellyfin_subtitles_off`` set to ask Jellyfin for no subtitles.
         self.jellyfin_subtitle: Optional[int] = None
         self.jellyfin_subtitles_off: bool = False
+        # Audio tracks the item offers and the one the host picked; None keeps
+        # whatever Jellyfin chooses for the item.
+        self.jellyfin_audio_tracks: List[Dict[str, Any]] = []
+        self.jellyfin_audio: Optional[int] = None
         # Transcode quality for this room.  The host moves it from the control
         # bar; ``jellyfin_bitrate_max`` is the server's ceiling, held here so
         # the picker knows how far it may go.
@@ -182,6 +186,8 @@ class Room:
             self.jellyfin_subtitle_tracks = []
             self.jellyfin_subtitle = None
             self.jellyfin_subtitles_off = False
+            self.jellyfin_audio_tracks = []
+            self.jellyfin_audio = None
         self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         # In-flight host reads belong to the old media; failing them also makes
@@ -204,6 +210,8 @@ class Room:
         self.jellyfin_subtitle_tracks = []
         self.jellyfin_subtitle = None
         self.jellyfin_subtitles_off = False
+        self.jellyfin_audio_tracks = []
+        self.jellyfin_audio = None
         self.host_media_id = None
         self.cache = BlockCache(block_size, cache_bytes)
         self.new_generation()
@@ -467,6 +475,8 @@ class Room:
             "jellyfin_subtitles": self.jellyfin_subtitle_tracks,
             "jellyfin_subtitle": self.jellyfin_subtitle,
             "jellyfin_subtitles_off": self.jellyfin_subtitles_off,
+            "jellyfin_audio_tracks": self.jellyfin_audio_tracks,
+            "jellyfin_audio": self.jellyfin_audio,
             "jellyfin_bitrate": self.jellyfin_bitrate,
             "jellyfin_bitrate_max": self.jellyfin_bitrate_max,
             "ended": self.ended,
@@ -508,6 +518,8 @@ class Room:
             "jellyfin_subtitles": self.jellyfin_subtitle_tracks,
             "jellyfin_subtitle": self.jellyfin_subtitle,
             "jellyfin_subtitles_off": self.jellyfin_subtitles_off,
+            "jellyfin_audio_tracks": self.jellyfin_audio_tracks,
+            "jellyfin_audio": self.jellyfin_audio,
             "jellyfin_bitrate": self.jellyfin_bitrate,
             "jellyfin_bitrate_max": self.jellyfin_bitrate_max,
             "cache": {

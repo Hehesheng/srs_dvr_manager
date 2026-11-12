@@ -68,6 +68,12 @@ class HlsSubtitleRequest(BaseModel):
     position: float = 0.0
 
 
+class HlsAudioRequest(BaseModel):
+    # The audio stream index the host picked.
+    audio: int
+    position: float = 0.0
+
+
 class HlsBitrateRequest(BaseModel):
     # Bits per second; the room clamps it to what the server may pull.
     bitrate: int
@@ -465,6 +471,32 @@ async def hls_subtitle(
         "subtitle": room.jellyfin_subtitle,
         "subtitles_off": room.jellyfin_subtitles_off,
     }
+
+
+@router.post("/api/rooms/{room_ref}/hls/audio")
+async def hls_audio(
+    room_ref: str,
+    payload: HlsAudioRequest,
+    request: Request,
+    x_host_token: Optional[str] = Header(default=None, alias="X-Host-Token"),
+):
+    """Choose the audio track every member hears.
+
+    A direct-play item is turned into a transcode the first time a track is
+    picked; afterwards the change restarts that transcode at ``position``, so
+    ``media_epoch`` moves and members follow without doing anything.
+    """
+    hall = _hall(request)
+    if hall is None:
+        return _error_json(status.HTTP_503_SERVICE_UNAVAILABLE, "HALL_UNAVAILABLE", "media hall is unavailable")
+    room = hall.get_room(room_ref)
+    if room is None:
+        return _error_json(status.HTTP_404_NOT_FOUND, protocol.ERR_ROOM_NOT_FOUND, "room not found")
+    try:
+        await hall.set_transcode_audio(room, x_host_token or "", payload.audio, payload.position)
+    except HallError as exc:
+        return _hall_error(exc)
+    return {"code": 0, "audio": room.jellyfin_audio}
 
 
 @router.post("/api/rooms/{room_ref}/hls/bitrate")
