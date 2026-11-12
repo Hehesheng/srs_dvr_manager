@@ -179,6 +179,8 @@ class HlsSession:
     # "whatever the account default picks" and ``subtitles_off`` means none.
     subtitle_index: Optional[int] = None
     subtitles_off: bool = False
+    # Which audio track this stream carries.  None means Jellyfin picked one.
+    audio_index: Optional[int] = None
     target_duration: float = 3.0
     segments: Dict[int, str] = field(default_factory=dict)
     durations: Dict[int, float] = field(default_factory=dict)
@@ -352,6 +354,90 @@ def subtitle_label(stream: Dict[str, Any], language: str = "") -> str:
         marks.append("强制")
     label = f"{base}（{'、'.join(marks)}）" if marks else base
     return label[:40]
+
+
+AUDIO_CODEC_NAMES = {
+    "aac": "AAC",
+    "ac3": "AC3",
+    "eac3": "E-AC3",
+    "dts": "DTS",
+    "truehd": "TrueHD",
+    "flac": "FLAC",
+    "mp3": "MP3",
+    "opus": "Opus",
+    "vorbis": "Vorbis",
+    "pcm_s16le": "PCM",
+    "pcm_s24le": "PCM",
+}
+
+AUDIO_LANGUAGE_NAMES = {
+    "japanese": "日语",
+    "english": "英语",
+    "mandarin": "国语",
+    "cantonese": "粤语",
+    "chinese": "中文",
+    "korean": "韩语",
+    "french": "法语",
+    "german": "德语",
+    "spanish": "西班牙语",
+    "russian": "俄语",
+}
+
+CHANNEL_NAMES = {1: "单声道", 2: "双声道", 6: "5.1", 8: "7.1"}
+
+
+def audio_label(stream: Dict[str, Any], language: str = "") -> str:
+    """``Japanese - FLAC - Stereo - 默认`` becomes ``日语 · FLAC 双声道（默认）``."""
+    raw = str(stream.get("DisplayTitle") or stream.get("Title") or "").strip()
+    parts = [part.strip() for part in re.split(r"\s+-\s+", raw) if part.strip()] if raw else []
+    lang = (language or str(stream.get("Language") or "")).strip().lower()
+    base = LANGUAGE_NAMES.get(lang, "")
+    if not base and parts:
+        base = AUDIO_LANGUAGE_NAMES.get(parts[0].lower(), "")
+    if not base:
+        base = parts[0] if parts else "音轨"
+    codec_key = str(stream.get("Codec") or "").strip().lower()
+    codec = AUDIO_CODEC_NAMES.get(codec_key) or codec_key.upper()
+    try:
+        channels = int(stream.get("Channels") or 0)
+    except (TypeError, ValueError):
+        channels = 0
+    channel_text = CHANNEL_NAMES.get(channels, f"{channels} 声道" if channels else "")
+    bits = " ".join(part for part in (codec, channel_text) if part)
+    marks: List[str] = []
+    flags = {part.lower() for part in parts[1:]}
+    if stream.get("IsDefault") or flags & {"默认", "default"}:
+        marks.append("默认")
+    label = f"{base} · {bits}" if bits else base
+    return (f"{label}（{'、'.join(marks)}）" if marks else label)[:40]
+
+
+def audio_streams(media_source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every audio track, in Jellyfin's own order, with a label fit for a menu."""
+    tracks: List[Dict[str, Any]] = []
+    for stream in media_streams(media_source):
+        if stream.get("Type") != "Audio":
+            continue
+        try:
+            index = int(stream.get("Index"))
+        except (TypeError, ValueError):
+            continue
+        language = str(stream.get("Language") or "").strip()
+        try:
+            channels = int(stream.get("Channels") or 0)
+        except (TypeError, ValueError):
+            channels = 0
+        tracks.append(
+            {
+                "index": index,
+                "label": audio_label(stream, language),
+                "language": language,
+                "codec": str(stream.get("Codec") or "").lower(),
+                "channels": channels,
+                "is_default": bool(stream.get("IsDefault")),
+            }
+        )
+    return tracks
 
 
 def subtitle_streams(media_source: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -653,6 +739,32 @@ class JellyfinClient:
 
     # -- browsing ------------------------------------------------------
     async def libraries(self, session: JellyfinSession) -> List[Dict[str, Any]]:
+        """The libraries this account can see.
+
+        ``/Library/VirtualFolders`` is the administrator's view of the server
+        and answers 403 for an ordinary account -- which is exactly what a
+        host who signed in with a username and password gets.  ``/Users/{id}
+        /Views`` is the same list after permissions, so use it whenever we
+        know who we are; only a session without a user id falls back to the
+        admin call.
+        """
+        if session.user_id:
+            payload = await self._json(
+                "GET", f"/Users/{session.user_id}/Views", session
+            )
+            result = []
+            for view in (payload or {}).get("Items") or []:
+                item_id = str(view.get("Id") or "")
+                if not item_id:
+                    continue
+                result.append(
+                    {
+                        "id": item_id,
+                        "name": str(view.get("Name") or "媒体库"),
+                        "collection_type": str(view.get("CollectionType") or ""),
+                    }
+                )
+            return result
         payload = await self._json("GET", "/Library/VirtualFolders", session)
         result = []
         for folder in payload or []:
@@ -881,6 +993,7 @@ class JellyfinClient:
         epoch: int,
         subtitle_index: Optional[int] = None,
         subtitles_off: bool = False,
+        audio_index: Optional[int] = None,
         max_bitrate: Optional[int] = None,
     ) -> HlsSession:
         """Start (or restart) a transcoding session at ``start_seconds``.
@@ -889,7 +1002,8 @@ class JellyfinClient:
         (it always answers with the account default), so the track is chosen
         by rewriting the query of the returned ``TranscodingUrl`` instead --
         together with a fresh ``PlaySessionId``, without which Jellyfin keeps
-        serving the previous session's segments.
+        serving the previous session's segments.  The audio track travels the
+        same way (``AudioStreamIndex``).
         """
         bitrate = clamp_bitrate(
             self.max_bitrate if max_bitrate is None else max_bitrate,
@@ -918,8 +1032,8 @@ class JellyfinClient:
         transcoding_url = str(source.get("TranscodingUrl") or "")
         if not transcoding_url:
             raise JellyfinError("Jellyfin 没有给出转码地址", "JELLYFIN_TRANSCODE_FAILED")
-        transcoding_url, rewritten_session_id = self._rewrite_transcode_subtitles(
-            transcoding_url, subtitle_index, subtitles_off
+        transcoding_url, rewritten_session_id, resolved_audio = self._rewrite_transcode_query(
+            transcoding_url, subtitle_index, subtitles_off, audio_index
         )
         master_url = self.absolute(transcoding_url)
         live_url = await self._resolve_live_url(session, master_url)
@@ -936,21 +1050,27 @@ class JellyfinClient:
             epoch=epoch,
             subtitle_index=subtitle_index,
             subtitles_off=subtitles_off,
+            audio_index=resolved_audio,
         )
 
     @staticmethod
-    def _rewrite_transcode_subtitles(
-        transcoding_url: str, subtitle_index: Optional[int], subtitles_off: bool
-    ) -> Tuple[str, Optional[str]]:
-        """Point the transcode at ``subtitle_index`` (or at no subtitle at all).
+    def _rewrite_transcode_query(
+        transcoding_url: str,
+        subtitle_index: Optional[int],
+        subtitles_off: bool,
+        audio_index: Optional[int] = None,
+    ) -> Tuple[str, Optional[str], Optional[int]]:
+        """Point the transcode at these tracks.
 
-        Returns the rewritten URL and the new ``PlaySessionId``, or the URL
-        unchanged and ``None`` when nothing needs to change.
+        Returns the rewritten URL, the new ``PlaySessionId`` (or ``None`` when
+        nothing changed) and the audio index the stream will carry -- the one
+        asked for, or the one Jellyfin itself chose.
         """
         # Jellyfin spells these SubtitleStreamIndex / SubtitleMethod /
-        # PlaySessionId; match them whatever case it sends.
+        # AudioStreamIndex / PlaySessionId; match them whatever case it sends.
         index_key = "subtitlestreamindex"
         method_key = "subtitlemethod"
+        audio_key = "audiostreamindex"
         session_key = "playsessionid"
 
         parsed = urlparse(transcoding_url)
@@ -958,32 +1078,55 @@ class JellyfinClient:
         lower = {key.lower() for key, _ in pairs}
         has_subtitle = index_key in lower or method_key in lower
 
+        resolved_audio: Optional[int] = None
+        if audio_index is not None:
+            resolved_audio = int(audio_index)
+        else:
+            for key, value in pairs:
+                if key.lower() == audio_key:
+                    try:
+                        resolved_audio = int(value)
+                    except (TypeError, ValueError):
+                        resolved_audio = None
+
         if subtitle_index is not None:
             wanted = {index_key: str(int(subtitle_index)), method_key: "Encode"}
         elif subtitles_off and has_subtitle:
             wanted = {index_key: None, method_key: None}
         else:
-            return transcoding_url, None
+            wanted = None
+
+        if wanted is None and audio_index is None:
+            return transcoding_url, None, resolved_audio
 
         new_session_id = uuid4().hex
         kept: List[Tuple[str, str]] = []
         for key, value in pairs:
             low = key.lower()
-            if low in (index_key, method_key):
+            if wanted is not None and low in (index_key, method_key):
                 if wanted.get(low) is not None:
                     kept.append((key, str(wanted[low])))
+                continue
+            if low == audio_key and audio_index is not None:
+                kept.append((key, str(int(audio_index))))
                 continue
             if low == session_key:
                 kept.append((key, new_session_id))
                 continue
             kept.append((key, value))
-        if wanted.get(index_key) is not None and index_key not in lower:
+        if wanted is not None and wanted.get(index_key) is not None and index_key not in lower:
             kept.append(("SubtitleStreamIndex", str(wanted[index_key])))
-        if wanted.get(method_key) is not None and method_key not in lower:
+        if wanted is not None and wanted.get(method_key) is not None and method_key not in lower:
             kept.append(("SubtitleMethod", str(wanted[method_key])))
+        if audio_index is not None and audio_key not in lower:
+            kept.append(("AudioStreamIndex", str(int(audio_index))))
         if session_key not in lower:
             kept.append(("PlaySessionId", new_session_id))
-        return urlunparse(parsed._replace(query=urlencode(kept, doseq=True))), new_session_id
+        return (
+            urlunparse(parsed._replace(query=urlencode(kept, doseq=True))),
+            new_session_id,
+            resolved_audio,
+        )
 
     async def _resolve_live_url(self, session: JellyfinSession, master_url: str) -> str:
         text = await self._json("GET", self._with_token(master_url, session), session, timeout=25.0)

@@ -16,6 +16,7 @@ from hall.jellyfin import (
     JellyfinClient,
     JellyfinError,
     JellyfinSession,
+    audio_streams,
     clamp_bitrate,
     clean_vtt,
     normalize_jellyfin_url,
@@ -115,7 +116,12 @@ class FakeJellyfinClient(JellyfinClient):
                     {
                         "Id": "ms-1",
                         "SupportsDirectPlay": False,
-                        "TranscodingUrl": f"/videos/x/master.m3u8?DeviceId=d1&PlaySessionId=ps-{index}",
+                        # Real Jellyfin names the audio track it picked, which
+                        # is what the room shows as the current one.
+                        "TranscodingUrl": (
+                            "/videos/x/master.m3u8?DeviceId=d1"
+                            f"&AudioStreamIndex=1&PlaySessionId=ps-{index}"
+                        ),
                         "PlaySessionId": f"ps-{index}",
                     }
                 ],
@@ -196,8 +202,8 @@ class FakeJellyfinClient(JellyfinClient):
                         "Id": "ms-direct",
                         "Container": "mp4",
                         "MediaStreams": [
-                            {"Type": "Video", "Codec": "h264"},
-                            {"Type": "Audio", "Codec": "aac"},
+                            {"Type": "Video", "Codec": "h264", "Index": 0},
+                            {"Type": "Audio", "Codec": "aac", "Index": 1, "Language": "eng"},
                             {
                                 "Type": "Subtitle",
                                 "Index": 1,
@@ -219,8 +225,22 @@ class FakeJellyfinClient(JellyfinClient):
                         "Id": "ms-1",
                         "Container": "mkv",
                         "MediaStreams": [
-                            {"Type": "Video", "Codec": "hevc"},
-                            {"Type": "Audio", "Codec": "flac"},
+                            {"Type": "Video", "Codec": "hevc", "Index": 0},
+                            {
+                                "Type": "Audio",
+                                "Codec": "flac",
+                                "Index": 1,
+                                "Language": "jpn",
+                                "Channels": 2,
+                                "IsDefault": True,
+                            },
+                            {
+                                "Type": "Audio",
+                                "Codec": "ac3",
+                                "Index": 5,
+                                "Language": "chi",
+                                "Channels": 6,
+                            },
                             {
                                 "Type": "Subtitle",
                                 "Index": 2,
@@ -242,6 +262,38 @@ class FakeJellyfinClient(JellyfinClient):
                                 "Codec": "pgssub",
                                 "Language": "chi",
                                 "DisplayTitle": "图形字幕 - PGS",
+                            },
+                        ],
+                    }
+                ],
+            }
+        if item_id == "multi-1":
+            # Direct playable, but with two audio tracks: a browser cannot
+            # swap those inside the file, so picking one has to transcode.
+            return {
+                "Id": item_id,
+                "Name": "双音轨",
+                "RunTimeTicks": 3600 * 10_000_000,
+                "MediaSources": [
+                    {
+                        "Id": "ms-multi",
+                        "Container": "mp4",
+                        "MediaStreams": [
+                            {"Type": "Video", "Codec": "h264", "Index": 0},
+                            {
+                                "Type": "Audio",
+                                "Codec": "aac",
+                                "Index": 1,
+                                "Language": "jpn",
+                                "Channels": 2,
+                                "IsDefault": True,
+                            },
+                            {
+                                "Type": "Audio",
+                                "Codec": "aac",
+                                "Index": 2,
+                                "Language": "chi",
+                                "Channels": 2,
                             },
                         ],
                     }
@@ -616,12 +668,13 @@ def test_burning_a_subtitle_rewrites_the_transcode_url_and_its_session():
         "/videos/x/master.m3u8?DeviceId=d1&MediaSourceId=ms-1"
         "&SubtitleStreamIndex=2&SubtitleMethod=Encode&PlaySessionId=old"
     )
-    rewritten, session_id = JellyfinClient._rewrite_transcode_subtitles(url, 3, False)
+    rewritten, session_id, audio = JellyfinClient._rewrite_transcode_query(url, 3, False)
     assert "SubtitleStreamIndex=3" in rewritten
     assert "SubtitleMethod=Encode" in rewritten
     assert f"PlaySessionId={session_id}" in rewritten
     assert session_id and session_id != "old"
     assert "PlaySessionId=old" not in rewritten
+    assert audio is None
     # MediaSourceId and DeviceId must survive: Jellyfin needs both.
     assert "MediaSourceId=ms-1" in rewritten
     assert "DeviceId=d1" in rewritten
@@ -629,13 +682,64 @@ def test_burning_a_subtitle_rewrites_the_transcode_url_and_its_session():
 
 def test_turning_subtitles_off_drops_the_burn_in_parameters():
     url = "/videos/x/master.m3u8?DeviceId=d1&SubtitleStreamIndex=2&SubtitleMethod=Encode&PlaySessionId=old"
-    rewritten, session_id = JellyfinClient._rewrite_transcode_subtitles(url, None, True)
+    rewritten, session_id, _ = JellyfinClient._rewrite_transcode_query(url, None, True)
     assert "SubtitleMethod" not in rewritten
     assert "SubtitleStreamIndex" not in rewritten
     assert f"PlaySessionId={session_id}" in rewritten
     # Nothing to do when the URL never asked for a subtitle.
     plain = "/videos/x/master.m3u8?DeviceId=d1&PlaySessionId=old"
-    assert JellyfinClient._rewrite_transcode_subtitles(plain, None, True) == (plain, None)
+    assert JellyfinClient._rewrite_transcode_query(plain, None, True) == (plain, None, None)
+
+
+def test_choosing_an_audio_track_rewrites_the_transcode_url_and_its_session():
+    url = (
+        "/videos/x/master.m3u8?DeviceId=d1&MediaSourceId=ms-1"
+        "&AudioStreamIndex=1&PlaySessionId=old"
+    )
+    rewritten, session_id, audio = JellyfinClient._rewrite_transcode_query(url, None, False, 3)
+    assert "AudioStreamIndex=3" in rewritten
+    assert "AudioStreamIndex=1" not in rewritten
+    assert f"PlaySessionId={session_id}" in rewritten
+    assert session_id and session_id != "old"
+    assert "MediaSourceId=ms-1" in rewritten
+    assert audio == 3
+    # A URL that never carried an audio index gets one appended.
+    bare = "/videos/x/master.m3u8?DeviceId=d1&PlaySessionId=old"
+    rewritten, _, audio = JellyfinClient._rewrite_transcode_query(bare, None, False, 2)
+    assert "AudioStreamIndex=2" in rewritten
+    assert audio == 2
+    # Without a request, the index Jellyfin chose is reported back unchanged.
+    assert JellyfinClient._rewrite_transcode_query(url, None, False) == (url, None, 1)
+    # Audio and subtitle can be changed in one go.
+    both = "/videos/x/master.m3u8?AudioStreamIndex=1&SubtitleStreamIndex=2&PlaySessionId=old"
+    rewritten, _, audio = JellyfinClient._rewrite_transcode_query(both, 3, False, 2)
+    assert "AudioStreamIndex=2" in rewritten
+    assert "SubtitleStreamIndex=3" in rewritten
+    assert audio == 2
+
+
+def test_audio_tracks_are_labelled_for_the_menu():
+    source = {
+        "MediaStreams": [
+            {"Type": "Video", "Index": 0, "Codec": "h264"},
+            {
+                "Type": "Audio",
+                "Index": 1,
+                "Codec": "truehd",
+                "Language": "jpn",
+                "Channels": 8,
+                "IsDefault": True,
+            },
+            {"Type": "Audio", "Index": 2, "Codec": "ac3", "Language": "chi", "Channels": 6},
+            {"Type": "Audio", "Index": 3, "Codec": "pcm_s16le", "Language": "chi", "Channels": 2},
+        ]
+    }
+    tracks = audio_streams(source)
+    assert [track["index"] for track in tracks] == [1, 2, 3]
+    assert tracks[0]["label"] == "日语 · TrueHD 7.1（默认）"
+    assert tracks[0]["is_default"] is True
+    assert tracks[1]["label"] == "简体中文 · AC3 5.1"
+    assert tracks[2]["label"] == "简体中文 · PCM 双声道"
 
 
 def test_the_profile_that_turns_subtitles_off_asks_for_none_to_be_burned():
@@ -1240,6 +1344,33 @@ def _recording_client(payload=None):
     return client, session, calls
 
 
+def test_libraries_ask_for_the_users_own_views():
+    # /Library/VirtualFolders is admin-only: a host who signed in with a
+    # password got HTTP 403 from it and never reached the picker.
+    views = {
+        "Items": [
+            {"Id": "v1", "Name": "Movie", "CollectionType": "movies"},
+            {"Id": "v2", "Name": "Documentary"},
+            {"Name": "no id"},
+        ]
+    }
+    client = JellyfinClient(None, "http://jelly.invalid", 1)
+    paths = []
+
+    async def fake_json(method, path, session=None, **kwargs):
+        paths.append(path)
+        return views
+
+    client._json = fake_json
+    session = JellyfinSession(token="t", user_id="u1", user_name="guest", device_id="d")
+    libraries = asyncio.run(client.libraries(session))
+    assert paths == ["/Users/u1/Views"]
+    assert libraries == [
+        {"id": "v1", "name": "Movie", "collection_type": "movies"},
+        {"id": "v2", "name": "Documentary", "collection_type": ""},
+    ]
+
+
 def test_children_mode_lists_one_folder_without_a_type_filter():
     client, session, calls = _recording_client()
     asyncio.run(client.items(session, "lib-1"))
@@ -1705,6 +1836,146 @@ def test_an_unknown_subtitle_track_is_refused(monkeypatch):
             headers={"X-Host-Token": room["host_token"]},
         )
         assert bad.status_code == 400
+
+
+def test_host_picks_the_audio_track_and_everyone_follows(monkeypatch):
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+
+        state = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        assert [track["index"] for track in state["jellyfin_audio_tracks"]] == [1, 5]
+        assert state["jellyfin_audio_tracks"][1]["label"] == "简体中文 · AC3 5.1"
+        # Jellyfin named the track it picked in the URL; the room shows that.
+        assert state["jellyfin_audio"] == 1
+
+        pick = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/audio",
+            json={"audio": 5, "position": 600.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert pick.status_code == 200, pick.text
+        assert pick.json()["audio"] == 5
+
+        info = _wait_epoch(client, room, 2)
+        assert info["media_epoch"] == 2, "picking an audio track must restart the transcode"
+        assert info["jellyfin_audio"] == 5
+        assert info["media_resume"] == 600.0
+        assert fake.opened[-1] == ("/Items/hls-1/PlaybackInfo", 600 * 10_000_000)
+
+        session = _hall(client).rooms[room["room_id"]].hls
+        assert session.audio_index == 5
+        assert "AudioStreamIndex=5" in session.live_url or session.audio_index == 5
+        assert session.play_session_id not in ("", "ps-1")
+        # The chosen track has to survive a later seek.
+        seek = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/seek",
+            json={"position": 900.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert seek.status_code == 200
+        info = _wait_epoch(client, room, 3)
+        assert info["media_epoch"] == 3
+        assert _hall(client).rooms[room["room_id"]].hls.audio_index == 5
+
+
+def test_picking_an_audio_track_turns_direct_play_into_a_transcode(monkeypatch):
+    """A browser cannot swap tracks inside a file it plays, so the room must switch."""
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "multi-1")
+        code = room["room_code"]
+
+        state = client.get(f"/hall/api/rooms/{code}").json()
+        assert state["media"]["playback_mode"] == "direct"
+        assert state["media_url"] and "/media/" in state["media_url"]
+        assert [track["index"] for track in state["jellyfin_audio_tracks"]] == [1, 2]
+        assert state["jellyfin_audio"] == 1
+
+        pick = client.post(
+            f"/hall/api/rooms/{code}/hls/audio",
+            json={"audio": 2, "position": 42.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert pick.status_code == 200, pick.text
+
+        info = _wait_epoch(client, room, 1)
+        assert info["media"]["playback_mode"] == "hls"
+        assert "live.m3u8" in info["media_url"]
+        # Direct play had no epoch; the first transcode is epoch 1, which is
+        # still a bump every member can follow.
+        assert info["media_epoch"] == 1
+        assert info["jellyfin_audio"] == 2
+        assert fake.opened[-1] == ("/Items/multi-1/PlaybackInfo", 42 * 10_000_000)
+        session = _hall(client).rooms[room["room_id"]].hls
+        assert session.audio_index == 2
+        # Now that it is transcoded, its subtitle tracks are burned in and
+        # listed, and the text track loaded for direct play is gone.
+        assert info["jellyfin_subtitles"] == []
+        assert info["subtitles"] == []
+
+        # Switching again is an ordinary restart.
+        again = client.post(
+            f"/hall/api/rooms/{code}/hls/audio",
+            json={"audio": 1, "position": 60.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert again.status_code == 200
+        info = _wait_epoch(client, room, 2)
+        assert info["media_epoch"] == 2
+        assert info["jellyfin_audio"] == 1
+        assert _hall(client).rooms[room["room_id"]].hls.audio_index == 1
+
+
+def test_audio_choice_is_host_only(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        member = client.post(
+            f"/hall/api/rooms/{room['room_code']}/join", json={"name": "bob"}
+        ).json()
+        denied = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/audio",
+            json={"audio": 5, "position": 10.0},
+            headers={"X-Host-Token": member["member_token"]},
+        )
+        assert denied.status_code == 403
+
+
+def test_an_unknown_audio_track_is_refused(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "hls-1")
+        bad = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/audio",
+            json={"audio": 99, "position": 10.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert bad.status_code == 400
+
+
+def test_a_single_track_item_offers_no_audio_menu(monkeypatch):
+    with _client(monkeypatch) as client:
+        _fake(client)
+        room = _create_room(client)
+        _login(client, room)
+        _item(client, room, "direct-1")
+        state = client.get(f"/hall/api/rooms/{room['room_code']}").json()
+        assert state["jellyfin_audio_tracks"] == []
+        refused = client.post(
+            f"/hall/api/rooms/{room['room_code']}/hls/audio",
+            json={"audio": 1, "position": 10.0},
+            headers={"X-Host-Token": room["host_token"]},
+        )
+        assert refused.status_code == 400
 
 
 def test_a_direct_item_loads_vtt_tracks_but_a_transcoded_one_does_not(monkeypatch):
