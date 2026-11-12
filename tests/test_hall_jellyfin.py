@@ -84,13 +84,20 @@ class FakeJellyfinClient(JellyfinClient):
             # The real client only gets here for a username and password.
             self.logins = getattr(self, "logins", [])
             self.logins.append(((body or {}).get("Username"), bool((body or {}).get("Pw"))))
+            if self.login_status == 403:
+                # The server took the password and still said no.
+                error = JellyfinError(
+                    "Jellyfin 返回 HTTP 403: Error processing request.", "JELLYFIN_UNAVAILABLE"
+                )
+                error.upstream_status = 403
+                raise error
             if (body or {}).get("Username") != "hehesheng" or (body or {}).get("Pw") != LOGIN_PASSWORD:
-                if self.login_status == 400:
+                if self.login_status:
                     error = JellyfinError(
-                        "Jellyfin 返回 HTTP 400: Error processing request.",
+                        f"Jellyfin 返回 HTTP {self.login_status}: Error processing request.",
                         "JELLYFIN_UNAVAILABLE",
                     )
-                    error.upstream_status = 400
+                    error.upstream_status = self.login_status
                     raise error
                 raise JellyfinAuthError("Jellyfin 认证已失效，请重新登录")
             return {"AccessToken": LOGIN_TOKEN, "User": {"Id": "user-1", "Name": "hehesheng"}}
@@ -448,6 +455,21 @@ def test_a_12x_server_answers_a_bad_login_with_400_and_still_reads_as_wrong_pass
         reply = _connect(client, room, username="hehesheng", password="wrong")
         assert reply.status_code == 401, reply.text
         assert reply.json()["message"] == "用户名或密码不对"
+
+
+def test_a_403_is_not_reported_as_a_wrong_password(monkeypatch):
+    # A 12.1 server can check the password, accept it, and still refuse the
+    # login.  The host should be told the server said no, not that the
+    # username and password were wrong.
+    with _client(monkeypatch) as client:
+        fake = _fake(client)
+        fake.login_status = 403
+        room = _create_room(client)
+        reply = _connect(client, room, username="hehesheng", password=LOGIN_PASSWORD)
+        assert reply.status_code == 401, reply.text
+        message = reply.json()["message"]
+        assert "403" in message and "拒绝" in message
+        assert "用户名或密码不对" not in message
 
 
 def test_a_password_needs_a_username_and_a_way_in_is_required(monkeypatch):

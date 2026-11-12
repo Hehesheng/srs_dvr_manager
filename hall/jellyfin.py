@@ -600,8 +600,17 @@ class JellyfinClient:
             # went stale.  Anything else (timeout, unreachable host) keeps its
             # own message -- calling a dead server "wrong password" would send
             # the host hunting in the Jellyfin console for nothing.
-            if isinstance(exc, JellyfinAuthError) or exc.upstream_status in (400, 401, 403):
+            if isinstance(exc, JellyfinAuthError) or exc.upstream_status in (400, 401):
                 raise JellyfinAuthError("用户名或密码不对")
+            if exc.upstream_status == 403:
+                # 12.1 servers can accept the password and still refuse the
+                # login (the account is restricted, or the server will not
+                # take a login from this network).  Saying "wrong password"
+                # sends the host after the one thing that is not wrong.
+                raise JellyfinAuthError(
+                    "Jellyfin 拒绝了这次登录（HTTP 403）：账号可能受限、登录设备数已满，"
+                    "或这台服务器不允许从当前网络登录"
+                )
             raise
         user = (payload or {}).get("User") or {}
         token = str((payload or {}).get("AccessToken") or "").strip()
